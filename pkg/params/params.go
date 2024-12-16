@@ -137,6 +137,23 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 
 	UpdateTranscodingEnabled(infoCopy)
 
+	// BEGIN OPENVIDU BLOCK
+	// Force VP8 without simulcast (1920x1080 30 fps)
+	videoEncodingOptions = &livekit.IngressVideoEncodingOptions{
+		VideoCodec: livekit.VideoCodec_VP8,
+		FrameRate:  30,
+		Layers: computeVideoLayers(&livekit.VideoLayer{
+			Quality: livekit.VideoQuality_HIGH,
+			Width:   1920,
+			Height:  1080,
+			Bitrate: 3_500_000,
+		}, 1),
+	}
+	// Force transcoding for WHIP (as WHIP sources are not guaranteed to publish VP8 without simulcast)
+	infoCopy.EnableTranscoding = proto.Bool(true)
+	UpdateTranscodingEnabled(infoCopy)
+	// END OPENVIDU BLOCK
+
 	if token == "" {
 		token, err = ingress.BuildIngressToken(conf.ApiKey, conf.ApiSecret, info.RoomName, info.ParticipantIdentity, info.ParticipantName, info.ParticipantMetadata)
 		if err != nil {
