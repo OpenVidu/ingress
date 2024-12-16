@@ -141,12 +141,12 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 	// Force VP8 without simulcast (1920x1080 30 fps)
 	videoEncodingOptions = &livekit.IngressVideoEncodingOptions{
 		VideoCodec: livekit.VideoCodec_VP8,
-		FrameRate:  30,
+		FrameRate:  conf.OpenVidu.FrameRate,
 		Layers: computeVideoLayers(&livekit.VideoLayer{
 			Quality: livekit.VideoQuality_HIGH,
-			Width:   1920,
-			Height:  1080,
-			Bitrate: 3_500_000,
+			Width:   conf.OpenVidu.Width,
+			Height:  conf.OpenVidu.Height,
+			Bitrate: conf.OpenVidu.Bitrate,
 		}, 1),
 	}
 	// Force transcoding for WHIP (as WHIP sources are not guaranteed to publish VP8 without simulcast)
