@@ -8,4 +8,13 @@ type OpenViduConfig struct {
 	Bitrate   uint32  `yaml:"bitrate"`
 }
 
+func DefaultOpenViduConfig() OpenViduConfig {
+	return OpenViduConfig{
+		Width:     1920,
+		Height:    1080,
+		FrameRate: 32,
+		Bitrate:   5000000,
+	}
+}
+
 // END OPENVIDU BLOCK

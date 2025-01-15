@@ -34,6 +34,10 @@ import (
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
+
+	// BEGIN OPENVIDU BLOCK
+	"github.com/livekit/ingress/pkg/openvidu"
+	// END OPENVIDU BLOCK
 )
 
 type Params struct {
@@ -139,14 +143,31 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 
 	// BEGIN OPENVIDU BLOCK
 	// Force VP8 without simulcast (1920x1080 30 fps)
+
+	customFrameRate := conf.OpenVidu.FrameRate
+	if customFrameRate == 0 {
+		customFrameRate = openvidu.DefaultOpenViduConfig().FrameRate
+	}
+	customWidth := conf.OpenVidu.Width
+	if customWidth == 0 {
+		customWidth = openvidu.DefaultOpenViduConfig().Width
+	}
+	customHeight := conf.OpenVidu.Height
+	if customHeight == 0 {
+		customHeight = openvidu.DefaultOpenViduConfig().Height
+	}
+	customBitrate := conf.OpenVidu.Bitrate
+	if customBitrate == 0 {
+		customBitrate = openvidu.DefaultOpenViduConfig().Bitrate
+	}
 	videoEncodingOptions = &livekit.IngressVideoEncodingOptions{
 		VideoCodec: livekit.VideoCodec_VP8,
-		FrameRate:  conf.OpenVidu.FrameRate,
+		FrameRate:  customFrameRate,
 		Layers: computeVideoLayers(&livekit.VideoLayer{
 			Quality: livekit.VideoQuality_HIGH,
-			Width:   conf.OpenVidu.Width,
-			Height:  conf.OpenVidu.Height,
-			Bitrate: conf.OpenVidu.Bitrate,
+			Width:   customWidth,
+			Height:  customHeight,
+			Bitrate: customBitrate,
 		}, 1),
 	}
 	// Force transcoding for WHIP (as WHIP sources are not guaranteed to publish VP8 without simulcast)
