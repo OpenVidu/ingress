@@ -106,6 +106,8 @@ func runService(c *cli.Context) error {
 		return err
 	}
 
+	logger.Infow("Rtc Engine: " + string(conf.OpenVidu.Rtc.Engine))
+
 	rc, err := redis.GetRedisClient(conf.Redis)
 	if err != nil {
 		return err
