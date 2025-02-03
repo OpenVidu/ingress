@@ -22,10 +22,16 @@ import (
 
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
+	"github.com/livekit/protocol/logger"
 )
 
 var (
 	supportedMimeTypes = []string{
+
+		// BEGIN OPENVIDU BLOCK
+		"application/x-rtp", // RTSP streams have this mime type
+		// END OPENVIDU BLOCK
+
 		"audio/x-m4a",
 		"application/x-hls",
 		"video/quicktime",
@@ -42,6 +48,11 @@ type URLSource struct {
 	params *params.Params
 	src    *gst.Element
 	pad    *gst.Pad
+
+	// BEGIN OPENVIDU BLOCK
+	srcAudio *gst.Element
+	Rtspsrc  *gst.Element
+	// END OPENVIDU BLOCK
 }
 
 func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
@@ -69,9 +80,144 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// BEGIN OPENVIDU BLOCK
+	} else if strings.HasPrefix(p.Url, "rtsp://") || strings.HasPrefix(p.Url, "rtsps://") {
+
+		elem, err = gst.NewElementWithName("rtspsrc", "rtspsrc")
+		if err != nil {
+			return nil, err
+		}
+		err = elem.SetProperty("location", p.Url)
+		if err != nil {
+			return nil, err
+		}
+		err = elem.SetProperty("latency", uint(2000))
+		if err != nil {
+			return nil, err
+		}
+		err = elem.SetProperty("drop-on-latency", true)
+		if err != nil {
+			return nil, err
+		}
+		err = elem.SetProperty("port-range", "0-0")
+		if err != nil {
+			return nil, err
+		}
+		// END OPENVIDU BLOCK
+
 	} else {
 		return nil, errors.ErrUnsupportedURLFormat
 	}
+
+	// BEGIN OPENVIDU BLOCK
+	if strings.HasPrefix(p.Url, "rtsp://") || strings.HasPrefix(p.Url, "rtsps://") {
+		// Video
+		videoqueue, _ := gst.NewElementWithName("queue2", "videoqueue")
+		bin.Add(videoqueue)
+		// Create video queue ghost sink
+		videoqueuesink := videoqueue.GetStaticPad("sink")
+		if videoqueuesink == nil {
+			return nil, errors.ErrUnableToAddPad
+		}
+		videoqueueghostsink := gst.NewGhostPad("sink", videoqueuesink)
+		bin.AddPad(videoqueueghostsink.Pad)
+		// Create video queue ghost source
+		videoqueuesrc := videoqueue.GetStaticPad("src")
+		if videoqueuesrc == nil {
+			return nil, errors.ErrUnableToAddPad
+		}
+		videoqueueghostsrc := gst.NewGhostPad("src", videoqueuesrc)
+		if !bin.AddPad(videoqueueghostsrc.Pad) {
+			return nil, errors.ErrUnableToAddPad
+		}
+
+		// Audio
+		audiobin := gst.NewBin("audioinput")
+		audioqueue, _ := gst.NewElementWithName("queue2", "audioqueue")
+		audiobin.Add(audioqueue)
+		// Create audio queue ghost sink
+		audioqueuesink := audioqueue.GetStaticPad("sink")
+		if audioqueuesink == nil {
+			return nil, errors.ErrUnableToAddPad
+		}
+		audioqueueghostsink := gst.NewGhostPad("sink", audioqueuesink)
+		audiobin.AddPad(audioqueueghostsink.Pad)
+		// Create audio queue ghost source
+		audioqueuesrc := audioqueue.GetStaticPad("src")
+		if audioqueuesrc == nil {
+			return nil, errors.ErrUnableToAddPad
+		}
+		audioqueueghostsrc := gst.NewGhostPad("src", audioqueuesrc)
+		if !audiobin.AddPad(audioqueueghostsrc.Pad) {
+			return nil, errors.ErrUnableToAddPad
+		}
+
+		elem.Connect("pad-added", func(src *gst.Element, pad *gst.Pad) {
+
+			padName := pad.GetName()
+
+			logger.Infow("rtspsrc pad-added", "padName", padName)
+
+			var queue *gst.Element
+			var sinkPad *gst.Pad
+			var getQueueErr error
+			isAudio := false
+			isVideo := false
+
+			pad.GetCurrentCaps().ForEach(func(features *gst.CapsFeatures, structure *gst.Structure) bool {
+				value, getMediaErr := structure.GetValue("media")
+				if getMediaErr != nil {
+					logger.Errorw("failed to get media value from caps", getMediaErr)
+					return false
+				}
+				if value == "audio" {
+					isAudio = true
+					return true
+				} else if value == "video" {
+					isVideo = true
+					return true
+				} else {
+					logger.Errorw("pad unrecognized media type", nil, "media", value)
+					return false
+				}
+			})
+
+			if isAudio {
+				sinkPad = audiobin.GetStaticPad("sink")
+				queue, getQueueErr = audiobin.GetElementByName("audioqueue")
+			} else if isVideo {
+				sinkPad = bin.GetStaticPad("sink")
+				queue, getQueueErr = bin.GetElementByName("videoqueue")
+			} else {
+				logger.Errorw("pad media type not audio nor video", nil, "padName", padName)
+				return
+			}
+
+			if sinkPad == nil {
+				logger.Errorw("failed to get sink pad", nil)
+				return
+			}
+			if getQueueErr != nil {
+				logger.Errorw("failed to get queue element", err)
+				return
+			}
+			padLinkReturnValue := pad.Link(sinkPad)
+			if padLinkReturnValue != gst.PadLinkOK && padLinkReturnValue != gst.PadLinkWasLinked {
+				logger.Errorw("failed to link pad", nil, "padLinkReturnValue", padLinkReturnValue)
+				return
+			}
+			queue.SyncStateWithParent()
+		})
+
+		return &URLSource{
+			params:   p,
+			src:      bin.Element,
+			srcAudio: audiobin.Element,
+			Rtspsrc:  elem,
+		}, nil
+	}
+	// END OPENVIDU BLOCK
 
 	queue, err := gst.NewElement("queue2")
 	if err != nil {
@@ -113,6 +259,14 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 }
 
 func (u *URLSource) GetSources() []*gst.Element {
+	// BEGIN OPENVIDU BLOCK
+	if u.srcAudio != nil {
+		return []*gst.Element{
+			u.src,
+			u.srcAudio,
+		}
+	}
+	// END OPENVIDU BLOCK
 	return []*gst.Element{
 		u.src,
 	}

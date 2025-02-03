@@ -72,6 +72,18 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 		trackStatsGatherer: make(map[types.StreamKind]*stats.MediaTrackStatGatherer),
 	}
 
+	// BEGIN OPENVIDU BLOCK
+	// We must add the rtspsrc element to the parent bin so it can later link its
+	// dynamic pads to the ghost sink pads of the video bin and audio bin
+	if strings.HasPrefix(p.Url, "rtsp://") || strings.HasPrefix(p.Url, "rtsps://") {
+		urlsource, ok := src.(*urlpull.URLSource)
+		if !ok {
+			return nil, errors.New("URL is rtsp but source is not of type URLSource")
+		}
+		bin.Add(urlsource.Rtspsrc)
+	}
+	// END OPENVIDU BLOCK
+
 	if p.InputType == livekit.IngressInput_URL_INPUT {
 		// Gather input stats from the pipeline
 		i.trackStatsGatherer[types.Audio] = g.RegisterTrackStats(stats.InputAudio)
