@@ -17,6 +17,7 @@ package urlpull
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"github.com/go-gst/go-gst/gst"
 
@@ -153,6 +154,8 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 			return nil, errors.ErrUnableToAddPad
 		}
 
+		var mu sync.Mutex
+
 		elem.Connect("pad-added", func(src *gst.Element, pad *gst.Pad) {
 
 			padName := pad.GetName()
@@ -183,6 +186,9 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 				}
 			})
 
+			mu.Lock()
+			defer mu.Unlock()
+
 			if isAudio {
 				sinkPad = audiobin.GetStaticPad("sink")
 				queue, getQueueErr = audiobin.GetElementByName("audioqueue")
@@ -202,6 +208,19 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 				logger.Errorw("failed to get queue element", err)
 				return
 			}
+
+			if sinkPad.IsLinked() {
+				var kind string
+				if isAudio {
+					kind = "audio"
+				} else {
+					kind = "video"
+				}
+				logger.Warnw("sink pad of kind "+kind+" is already linked", nil)
+				logger.Warnw("this usually means that the source is sending multiple streams of the same kind", nil)
+				return
+			}
+
 			padLinkReturnValue := pad.Link(sinkPad)
 			if padLinkReturnValue != gst.PadLinkOK && padLinkReturnValue != gst.PadLinkWasLinked {
 				logger.Errorw("failed to link pad", nil, "padLinkReturnValue", padLinkReturnValue)

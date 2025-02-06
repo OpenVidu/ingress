@@ -165,7 +165,18 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 			err = i.source.ValidateCaps(caps.(*gst.Caps))
 			if err != nil {
 				logger.Infow("input caps validation failed", "error", err)
-				return
+
+				// BEGIN OPENVIDU BLOCK
+				// In some occasions the caps might be empty when using rtspsrc
+				// Simply ignore this error if this is the case
+				rtspsrcElement, rtspsrcError := i.bin.GetElementByName("rtspsrc")
+				if rtspsrcError == nil && rtspsrcElement != nil {
+					logger.Infow("Ignore validation caps as we are using rtspsrc")
+					err = nil
+				} else {
+					return
+				}
+				// END OPENVIDU BLOCK
 			}
 		}
 	}
