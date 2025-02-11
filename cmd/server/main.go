@@ -106,9 +106,13 @@ func runService(c *cli.Context) error {
 		return err
 	}
 
+	// BEGIN OPENVIDU BLOCK
 	if conf.OpenVidu.Rtc.Engine != "" {
-		logger.Infow("Rtc Engine: " + string(conf.OpenVidu.Rtc.Engine))
+		fmt.Println("Rtc Engine: " + string(conf.OpenVidu.Rtc.Engine))
+	} else {
+		fmt.Println("Rtc Engine not set. Using pion")
 	}
+	// END OPENVIDU BLOCK
 
 	rc, err := redis.GetRedisClient(conf.Redis)
 	if err != nil {
