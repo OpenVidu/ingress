@@ -1,0 +1,28 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch pion",
+      "type": "go",
+      "request": "launch",
+      "preLaunchTask": "go: build package",
+      "env": {
+        "INGRESS_CONFIG_BODY": "openvidu:\n  rtc:\n    engine: pion\nredis:\n  address: 127.0.0.1:6379\n  username: \"\"\n  password: redispassword\n  db: 0\n  use_tls: false\napi_key: devkey\napi_secret: secret\nws_url: ws://127.0.0.1:7880\nrtmp_port: 1935\nwhip_port: 8085\nhttp_relay_port: 9090\nhealth_port: 9091\nlogging:\n  json: false\n  level: debug\ndevelopment: false\nrtc_config:\n  udp_port: 7895\ndebug_handler_port: 40000\ncpu_cost:\n  min_idle_ratio: 0.01\n  rtmp_cpu_cost: -10\n  whip_cpu_cost: -10\n  whip_bypass_transcoding_cpu_cost: -10\n  url_cpu_cost: -10\n"
+      },
+      "program": "${workspaceFolder}/cmd/server"
+    },
+    {
+      "name": "Launch mediasoup",
+      "type": "go",
+      "request": "launch",
+      "preLaunchTask": "go: build package",
+      "env": {
+        "INGRESS_CONFIG_BODY": "openvidu:\n  rtc:\n    engine: mediasoup\nredis:\n  address: 127.0.0.1:6379\n  username: \"\"\n  password: redispassword\n  db: 0\n  use_tls: false\napi_key: devkey\napi_secret: secret\nws_url: ws://127.0.0.1:7880\nrtmp_port: 1935\nwhip_port: 8085\nhttp_relay_port: 9090\nhealth_port: 9091\nlogging:\n  json: false\n  level: debug\ndevelopment: false\nrtc_config:\n  udp_port: 7895\ndebug_handler_port: 40000\ncpu_cost:\n  min_idle_ratio: 0.01\n  rtmp_cpu_cost: -10\n  whip_cpu_cost: -10\n  whip_bypass_transcoding_cpu_cost: -10\n  url_cpu_cost: -10\n"
+      },
+      "program": "${workspaceFolder}/cmd/server"
+    }
+  ]
+}

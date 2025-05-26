@@ -163,6 +163,7 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 		// Force transcoding for WHIP (as WHIP sources are not guaranteed to publish VP8 without simulcast)
 		infoCopy.EnableTranscoding = proto.Bool(true)
 		UpdateTranscodingEnabled(infoCopy)
+		fmt.Println("Using mediasoup. Forcing VP8 video codec without simulcast. Forcing one layer of width", videoEncodingOptions.Layers[0].Width, "height", videoEncodingOptions.Layers[0].Height, "and bitrate", videoEncodingOptions.FrameRate, ". Forcing transcoding for WHIP.")
 	}
 	// END OPENVIDU BLOCK
 
