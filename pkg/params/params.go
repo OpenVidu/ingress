@@ -34,6 +34,10 @@ import (
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
+
+	// BEGIN OPENVIDU BLOCK
+	"github.com/livekit/ingress/pkg/openvidupro/openviduproconfig"
+	// END OPENVIDU BLOCK
 )
 
 type Params struct {
@@ -136,6 +140,31 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 	}
 
 	UpdateTranscodingEnabled(infoCopy)
+
+	// BEGIN OPENVIDU BLOCK
+	if conf.OpenVidu.Rtc.Engine == openviduproconfig.RtcEngineMediasoup {
+		// Force VP8 without simulcast. As video encoding options, use the highest quality layer values
+		var highestQualityLayer *livekit.VideoLayer
+		for _, layer := range videoEncodingOptions.Layers {
+			if highestQualityLayer == nil || (layer.Quality != livekit.VideoQuality_OFF && layer.Quality > highestQualityLayer.Quality) {
+				highestQualityLayer = layer
+			}
+		}
+		videoEncodingOptions = &livekit.IngressVideoEncodingOptions{
+			VideoCodec: livekit.VideoCodec_VP8,
+			FrameRate:  videoEncodingOptions.FrameRate,
+			Layers: computeVideoLayers(&livekit.VideoLayer{
+				Quality: livekit.VideoQuality_HIGH,
+				Width:   highestQualityLayer.Width,
+				Height:  highestQualityLayer.Height,
+				Bitrate: highestQualityLayer.Bitrate,
+			}, 1),
+		}
+		// Force transcoding for WHIP (as WHIP sources are not guaranteed to publish VP8 without simulcast)
+		infoCopy.EnableTranscoding = proto.Bool(true)
+		UpdateTranscodingEnabled(infoCopy)
+	}
+	// END OPENVIDU BLOCK
 
 	if token == "" {
 		token, err = ingress.BuildIngressToken(conf.ApiKey, conf.ApiSecret, info.RoomName, info.ParticipantIdentity, info.ParticipantName, info.ParticipantMetadata)

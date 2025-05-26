@@ -27,6 +27,10 @@ import (
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
 	lksdk "github.com/livekit/server-sdk-go/v2"
+
+	// BEGIN OPENVIDU BLOCK
+	"github.com/livekit/ingress/pkg/openvidupro/openviduproconfig"
+	// END OPENVIDU BLOCK
 )
 
 const (
@@ -42,6 +46,10 @@ var (
 type Config struct {
 	*ServiceConfig  `yaml:",inline"`
 	*InternalConfig `yaml:",inline"`
+
+	// BEGIN OPENVIDU BLOCK
+	OpenVidu openviduproconfig.OpenViduProConfig `yaml:"openvidu"`
+	// END OPENVIDU BLOCK
 }
 
 type ServiceConfig struct {
