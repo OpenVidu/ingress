@@ -72,6 +72,18 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 		trackStatsGatherer: make(map[types.StreamKind]*stats.MediaTrackStatGatherer),
 	}
 
+	// BEGIN OPENVIDU BLOCK
+	// We must add the rtspsrc element to the parent bin so it can later link its
+	// dynamic pads to the ghost sink pads of the video bin and audio bin
+	if strings.HasPrefix(p.Url, "rtsp://") || strings.HasPrefix(p.Url, "rtsps://") {
+		urlsource, ok := src.(*urlpull.URLSource)
+		if !ok {
+			return nil, errors.New("URL is rtsp but source is not of type URLSource")
+		}
+		bin.Add(urlsource.Rtspsrc)
+	}
+	// END OPENVIDU BLOCK
+
 	if p.InputType == livekit.IngressInput_URL_INPUT {
 		// Gather input stats from the pipeline
 		i.trackStatsGatherer[types.Audio] = g.RegisterTrackStats(stats.InputAudio)
@@ -153,7 +165,18 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 			err = i.source.ValidateCaps(caps.(*gst.Caps))
 			if err != nil {
 				logger.Infow("input caps validation failed", "error", err)
-				return
+
+				// BEGIN OPENVIDU BLOCK
+				// In some occasions the caps might be empty when using rtspsrc
+				// Simply ignore this error if this is the case
+				rtspsrcElement, rtspsrcError := i.bin.GetElementByName("rtspsrc")
+				if rtspsrcError == nil && rtspsrcElement != nil {
+					logger.Infow("Ignore validation caps as we are using rtspsrc")
+					err = nil
+				} else {
+					return
+				}
+				// END OPENVIDU BLOCK
 			}
 		}
 	}
