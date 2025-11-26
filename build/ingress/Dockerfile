@@ -45,12 +45,18 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then GOARCH=arm64; else GOARCH=amd
 
 FROM livekit/gstreamer:$GSTVERSION-prod
 
+# BEGIN OPENVIDU BLOCK
 # install wget for health check
-RUN apt-get update && apt-get install -y wget
+RUN apt-get update && apt-get install -y wget && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# clean up
-RUN apt-get clean && \
-    rm -rf /var/lib/apt/lists/* 
+# Add timezone support
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    apt-get install -y tzdata && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+# END OPENVIDU BLOCK
 
 # copy binary
 COPY --from=0 /workspace/ingress /bin/
