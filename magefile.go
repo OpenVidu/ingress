@@ -33,8 +33,8 @@ var Default = Build
 
 const (
 	imageName  = "livekit/ingress"
-	gstVersion = "1.22.5"
-	goVersion  = "1.21.5"
+	gstVersion = "1.26.7"
+	goVersion  = "1.25.0"
 )
 
 var plugins = []string{"gstreamer", "gst-plugins-base", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly", "gst-libav"}

@@ -59,12 +59,17 @@ type ServiceConfig struct {
 	HTTPRelayPort    int           `yaml:"http_relay_port"`
 	Logging          logger.Config `yaml:"logging"`
 	Development      bool          `yaml:"development"`
+	WHIPProxyEnabled bool          `yaml:"whip_proxy_enabled"` // If true, WHIP requests with transcoding bypassed will be handled by the SFU directly
 
 	// Used for WHIP transport
 	RTCConfig rtcconfig.RTCConfig `yaml:"rtc_config"`
 
 	// CPU costs for various ingress types
 	CPUCost CPUCostConfig `yaml:"cpu_cost"`
+
+	// Experimental config
+	// Reduces ingest e2e latency by dropping excess preroll buffers
+	EnableStreamLatencyReduction bool `yaml:"enable_stream_latency_reduction"`
 }
 
 type InternalConfig struct {
