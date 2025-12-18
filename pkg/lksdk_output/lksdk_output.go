@@ -22,13 +22,16 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/mediatransportutil/pkg/pacer"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/logger/medialogutils"
 	"github.com/livekit/protocol/tracer"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 )
@@ -38,6 +41,7 @@ const (
 )
 
 type SampleProvider interface {
+	QueueLength() int
 	Close() error
 }
 type KeyFrameEmitter interface {
@@ -46,6 +50,24 @@ type KeyFrameEmitter interface {
 
 type PacketSink interface {
 	HandleRTCPPacket(pkt rtcp.Packet) error
+}
+
+type LocalTrack struct {
+	*lksdk.LocalTrack
+
+	w *MediaWatchdog
+}
+
+func (s *LocalTrack) WriteRTP(p *rtp.Packet, opts *lksdk.SampleWriteOptions) error {
+	s.w.MediaReceived(int64(len(p.Payload)))
+
+	return s.LocalTrack.WriteRTP(p, opts)
+}
+
+func (s *LocalTrack) WriteSample(sample media.Sample, opts *lksdk.SampleWriteOptions) error {
+	s.w.MediaReceived(int64(len(sample.Data)))
+
+	return s.LocalTrack.WriteSample(sample, opts)
 }
 
 type RTCPHandler struct {
@@ -86,8 +108,9 @@ type LKSDKOutput struct {
 	room   *lksdk.Room
 	params *params.Params
 
-	errChan  chan error
-	watchdog *Watchdog
+	errChan       chan error
+	trackWatchdog *TrackWatchdog
+	mediaWatchdog *MediaWatchdog
 
 	lock    sync.Mutex
 	outputs []SampleProvider
@@ -103,7 +126,7 @@ func NewLKSDKOutput(ctx context.Context, onDisconnected func(), p *params.Params
 		logger:  p.GetLogger(),
 	}
 
-	s.watchdog = NewWatchdog(func() {
+	s.trackWatchdog = NewTrackWatchdog(func() {
 		s.logger.Warnw("disconnection from room triggered by watchdog", errors.ErrRoomDisconnectedUnexpectedly)
 
 		select {
@@ -112,6 +135,22 @@ func NewLKSDKOutput(ctx context.Context, onDisconnected func(), p *params.Params
 		}
 
 		s.closeOutput()
+	}, watchdogDeadline)
+
+	s.mediaWatchdog = NewMediaWatchdog(func() {
+		s.logger.Infow("no media recieved after timeout", errors.ErrSourceNotReady)
+
+		select {
+		case s.errChan <- errors.ErrSourceNotReady:
+		default:
+		}
+
+		s.closeOutput()
+
+		if onDisconnected != nil {
+			onDisconnected()
+		}
+
 	}, watchdogDeadline)
 
 	cb := lksdk.NewRoomCallback()
@@ -170,15 +209,18 @@ func NewLKSDKOutput(ctx context.Context, onDisconnected func(), p *params.Params
 		}
 	}
 
-	room, err := lksdk.ConnectToRoomWithToken(
-		p.WsUrl,
-		p.Token,
-		cb,
-		opts...,
-	)
+	room := lksdk.NewRoom(cb)
+	room.SetLogger(medialogutils.NewOverrideLogger(p.GetLogger()))
+
+	err := room.JoinWithToken(p.WsUrl, p.Token, opts...)
 	if err != nil {
 		return nil, err
 	}
+
+	// The resourceID may not be available when the token is created
+	room.LocalParticipant.SetAttributes(map[string]string{
+		livekit.AttrIngressResourceID: p.State.ResourceId,
+	})
 
 	s.room = room
 	s.logger = p.GetLogger().WithValues("roomID", room.SID())
@@ -190,7 +232,7 @@ func NewLKSDKOutput(ctx context.Context, onDisconnected func(), p *params.Params
 	return s, nil
 }
 
-func (s *LKSDKOutput) AddAudioTrack(mimeType string, disableDTX bool, stereo bool) (*lksdk.LocalTrack, error) {
+func (s *LKSDKOutput) AddAudioTrack(mimeType string, disableDTX bool, stereo bool) (*LocalTrack, error) {
 	opts := &lksdk.TrackPublicationOptions{
 		Name:       s.params.Audio.Name,
 		Source:     s.params.Audio.Source,
@@ -205,12 +247,12 @@ func (s *LKSDKOutput) AddAudioTrack(mimeType string, disableDTX bool, stereo boo
 	}
 
 	track.OnBind(func() {
-		s.watchdog.TrackBound()
+		s.trackWatchdog.TrackBound()
 		s.logger.Debugw("audio track bound")
 	})
 
 	track.OnUnbind(func() {
-		s.watchdog.TrackUnbound()
+		s.trackWatchdog.TrackUnbound()
 		s.logger.Debugw("audio track unbound")
 	})
 
@@ -220,12 +262,17 @@ func (s *LKSDKOutput) AddAudioTrack(mimeType string, disableDTX bool, stereo boo
 		return nil, err
 	}
 
-	s.watchdog.TrackAdded()
+	s.trackWatchdog.TrackAdded()
 
-	return track, nil
+	wrappedTrack := &LocalTrack{
+		LocalTrack: track,
+		w:          s.mediaWatchdog,
+	}
+
+	return wrappedTrack, nil
 }
 
-func (s *LKSDKOutput) AddVideoTrack(layers []*livekit.VideoLayer, mimeType string) ([]*lksdk.LocalTrack, []*RTCPHandler, error) {
+func (s *LKSDKOutput) AddVideoTrack(layers []*livekit.VideoLayer, mimeType string) ([]*LocalTrack, []*RTCPHandler, error) {
 	opts := &lksdk.TrackPublicationOptions{
 		Name:        s.params.Video.Name,
 		Source:      s.params.Video.Source,
@@ -235,7 +282,7 @@ func (s *LKSDKOutput) AddVideoTrack(layers []*livekit.VideoLayer, mimeType strin
 
 	var err error
 
-	tracks := make([]*lksdk.LocalSampleTrack, 0)
+	tracks := make([]*lksdk.LocalTrack, 0)
 	rtcpHandlers := make([]*RTCPHandler, 0)
 	for _, layer := range layers {
 		rtcpHandler := &RTCPHandler{}
@@ -264,17 +311,17 @@ func (s *LKSDKOutput) AddVideoTrack(layers []*livekit.VideoLayer, mimeType strin
 
 		localLayer := layer
 		track.OnBind(func() {
-			s.watchdog.TrackBound()
+			s.trackWatchdog.TrackBound()
 			s.logger.Debugw("video track bound", "layer", localLayer.Quality.String())
 		})
 		track.OnUnbind(func() {
-			s.watchdog.TrackUnbound()
+			s.trackWatchdog.TrackUnbound()
 			s.logger.Debugw("video track unbound", "layer", localLayer.Quality.String())
 		})
 
 		tracks = append(tracks, track)
 
-		s.watchdog.TrackAdded()
+		s.trackWatchdog.TrackAdded()
 	}
 
 	_, err = s.room.LocalParticipant.PublishSimulcastTrack(tracks, opts)
@@ -285,13 +332,30 @@ func (s *LKSDKOutput) AddVideoTrack(layers []*livekit.VideoLayer, mimeType strin
 
 	s.logger.Debugw("published video track")
 
-	return tracks, rtcpHandlers, nil
+	wrappedTracks := make([]*LocalTrack, 0)
+	for _, track := range tracks {
+		wrappedTracks = append(wrappedTracks, &LocalTrack{
+			LocalTrack: track,
+			w:          s.mediaWatchdog,
+		})
+	}
+
+	return wrappedTracks, rtcpHandlers, nil
 }
 
 func (s *LKSDKOutput) AddOutputs(o ...SampleProvider) {
 	s.lock.Lock()
 	s.outputs = append(s.outputs, o...)
 	s.lock.Unlock()
+}
+
+func (s *LKSDKOutput) GetOutputs() []SampleProvider {
+	s.lock.Lock()
+	ret := make([]SampleProvider, len(s.outputs))
+	copy(ret, s.outputs)
+	s.lock.Unlock()
+
+	return ret
 }
 
 func (s *LKSDKOutput) closeOutput() {
@@ -306,8 +370,12 @@ func (s *LKSDKOutput) closeOutput() {
 	// only close the outputs once
 	s.outputs = nil
 
-	if s.watchdog != nil {
-		s.watchdog.Stop()
+	if s.trackWatchdog != nil {
+		s.trackWatchdog.Stop()
+	}
+
+	if s.mediaWatchdog != nil {
+		s.mediaWatchdog.Stop()
 	}
 
 	if s.room != nil {
@@ -330,6 +398,10 @@ func (s *LKSDKOutput) WriteRTCP(pkts []rtcp.Packet) error {
 	}
 
 	return pc.WriteRTCP(pkts)
+}
+
+func (s *LKSDKOutput) UpdateLocalParticipantAttributes(attributes map[string]string) {
+	s.room.LocalParticipant.SetAttributes(attributes)
 }
 
 func (s *LKSDKOutput) Close() error {

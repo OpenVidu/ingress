@@ -18,6 +18,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/frostbyte73/core"
 	"github.com/go-gst/go-gst/gst"
@@ -34,10 +35,14 @@ import (
 	"github.com/livekit/protocol/logger"
 )
 
+const (
+	packetLatencyCaps = "application/x-livekit-latency"
+)
+
 type Source interface {
 	GetSources() []*gst.Element
 	ValidateCaps(*gst.Caps) error
-	Start(ctx context.Context) error
+	Start(ctx context.Context, onClose func()) error
 	Close() error
 }
 
@@ -55,6 +60,19 @@ type Input struct {
 	onOutputReady OutputReadyFunc
 	closeFuse     core.Fuse
 	closeErr      error
+
+	enableStreamLatencyReduction bool
+
+	padTiming map[string]*padTimingState
+
+	gateMu         sync.Mutex
+	gateReady      map[string]bool
+	gateAllReady   bool
+	gateOffset     time.Duration
+	gateTerminator sync.Once
+	latencyCaps    *gst.Caps
+
+	onEOS func()
 }
 
 type OutputReadyFunc func(pad *gst.Pad, kind types.StreamKind)
@@ -66,10 +84,15 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 	}
 
 	bin := gst.NewBin("input")
+
 	i := &Input{
-		bin:                bin,
-		source:             src,
-		trackStatsGatherer: make(map[types.StreamKind]*stats.MediaTrackStatGatherer),
+		bin:                          bin,
+		source:                       src,
+		trackStatsGatherer:           make(map[types.StreamKind]*stats.MediaTrackStatGatherer),
+		enableStreamLatencyReduction: shouldEnableStreamLatencyReduction(p),
+		padTiming:                    make(map[string]*padTimingState),
+		gateReady:                    make(map[string]bool),
+		latencyCaps:                  gst.NewCapsFromString(packetLatencyCaps),
 	}
 
 	// BEGIN OPENVIDU BLOCK
@@ -134,8 +157,29 @@ func (i *Input) OnOutputReady(f OutputReadyFunc) {
 	i.onOutputReady = f
 }
 
-func (i *Input) Start(ctx context.Context) error {
-	return i.source.Start(ctx)
+func (i *Input) SetOnEOS(f func()) {
+	i.onEOS = f
+}
+
+func (i *Input) Start(ctx context.Context, onCloseTimeout func(ctx context.Context)) error {
+	return i.source.Start(ctx, func() {
+		if i.onEOS != nil {
+			i.onEOS()
+		}
+
+		go func() {
+			t := time.NewTimer(5 * time.Second)
+			select {
+			case <-t.C:
+				logger.Infow("timeout while waiting for source closure to trigger pipeline stop. Pipeline frozen")
+				if onCloseTimeout != nil {
+					onCloseTimeout(context.Background())
+				}
+			case <-i.closeFuse.Watch():
+				t.Stop()
+			}
+		}()
+	})
 }
 
 func (i *Input) Close() error {
@@ -181,17 +225,28 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 		}
 	}
 
+	// Make sure we emit scte35 markers if available
+	tsparser, _ := i.bin.GetElementByName("tsdemux0")
+	if tsparser != nil {
+		err := tsparser.SetProperty("send-scte35-events", true)
+		if err != nil {
+			logger.Errorw("failed setting `send-scte35-events` property", err)
+		}
+	}
+
 	// surface callback for first audio and video pads, plug in fakesink on the rest
 	i.lock.Lock()
 	newPad := false
 	var kind types.StreamKind
 	var ghostPad *gst.GhostPad
+	var timingState *padTimingState
 	if strings.HasPrefix(pad.GetName(), "audio") {
 		if i.audioOutput == nil {
 			newPad = true
 			kind = types.Audio
 			i.audioOutput = pad
 			ghostPad = gst.NewGhostPad("audio", pad)
+			timingState = &padTimingState{}
 		}
 	} else if strings.HasPrefix(pad.GetName(), "video") {
 		if i.videoOutput == nil {
@@ -199,6 +254,7 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 			kind = types.Video
 			i.videoOutput = pad
 			ghostPad = gst.NewGhostPad("video", pad)
+			timingState = &padTimingState{}
 		}
 	}
 	i.lock.Unlock()
@@ -210,11 +266,19 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 			return
 		}
 		pad = ghostPad.Pad
+		padName := pad.GetName()
 
-		if i.trackStatsGatherer[kind] != nil {
-			// Gather bitrate stats from pipeline itself
-			i.addBitrateProbe(kind)
+		logger.Debugw("input ghost pad added", "padName", padName)
+
+		if i.enableStreamLatencyReduction {
+			state := timingState
+			i.registerGatePad(padName, state)
+			i.addGateProbe(pad, padName, state)
+			i.addSegmentEventProbe(pad, padName, state)
 		}
+
+		// Gather bitrate stats & attach latency meta from the pipeline
+		i.addStatsCollectionProbe(kind)
 	} else {
 		var sink *gst.Element
 
@@ -235,8 +299,9 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 	}
 }
 
-func (i *Input) addBitrateProbe(kind types.StreamKind) {
-	// Do a best effort to add probe to retrieve bitrate.
+func (i *Input) addStatsCollectionProbe(kind types.StreamKind) {
+	// Do a best effort to add probe to retrieve bitrate and ingest time metadata.
+	// Time metadata would be best ingested at the source but flv muxer doesn't support carrying it through.
 	// The multiqueue is generally created in the pipeline before the decoders
 	mq, err := i.bin.GetElementByName("multiqueue0")
 
@@ -258,9 +323,9 @@ func (i *Input) addBitrateProbe(kind types.StreamKind) {
 			gstStruct := caps.GetStructureAt(0)
 			padKind := getKindFromGstMimeType(gstStruct)
 
-			if padKind == kind {
-				g := i.trackStatsGatherer[kind]
+			g := i.trackStatsGatherer[kind]
 
+			if padKind == kind {
 				pad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
 					buffer := info.GetBuffer()
 					if buffer == nil {
@@ -268,7 +333,13 @@ func (i *Input) addBitrateProbe(kind types.StreamKind) {
 					}
 
 					size := buffer.GetSize()
-					g.MediaReceived(size)
+					if g != nil {
+						g.MediaReceived(size)
+					}
+
+					// mark the packet with the current time to be able to calculate packet processing latency at output stage
+					now := time.Now()
+					buffer.AddReferenceTimestampMeta(i.latencyCaps, gst.ClockTime(uint64(now.UnixNano())), gst.ClockTime(0))
 
 					return gst.PadProbeOK
 				})
@@ -281,4 +352,27 @@ func (i *Input) addBitrateProbe(kind types.StreamKind) {
 	}
 
 	logger.Debugw("no pad on multiqueue with required kind found", "kind", kind)
+}
+
+func shouldEnableStreamLatencyReduction(p *params.Params) bool {
+	enableGate := p.Config.EnableStreamLatencyReduction
+	if !enableGate {
+		return false
+	}
+
+	// whip RTP streams are independent and common latency reduction offset can't be applied
+	if p.InputType == livekit.IngressInput_WHIP_INPUT {
+		return false
+	}
+
+	if p.InputType == livekit.IngressInput_URL_INPUT &&
+		(strings.HasPrefix(p.Url, "http://") || strings.HasPrefix(p.Url, "https://")) {
+		// Disable for non SRT URLs
+		// For sreaming VOD files or HLS streams over HTTP, at least 1 segment worth of data will be buffered.
+		// That doesn't allow arrival rate based latency reduction to be applied.
+		return false
+	}
+
+	logger.Debugw("stream latency reduction enabled", "inputType", p.InputType)
+	return true
 }

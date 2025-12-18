@@ -26,18 +26,22 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/livekit/ingress/pkg/errors"
+	"github.com/livekit/ingress/pkg/lksdk_output"
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/psrpc"
-	lksdk "github.com/livekit/server-sdk-go/v2"
 )
 
 const (
 	opusFrameSize = 20
 
 	pixelsPerEncoderThread = 640 * 480
+
+	queueCapacity         = 5
+	latencySampleInterval = 500 * time.Millisecond
+	eosQueueDrainTimeout  = 2 * time.Second
 )
 
 // Output manages GStreamer elements that converts & encodes video to the specification that's
@@ -50,12 +54,18 @@ type Output struct {
 	enc                *gst.Element
 	sink               *app.Sink
 	outputSync         *utils.TrackOutputSynchronizer
+	isPlayingTooSlow   func() bool
 	trackStatsGatherer *stats.MediaTrackStatGatherer
+	queue              *utils.BlockingQueue[*sample]
+	eos                *eosDispatcher
 
-	localTrack   atomic.Pointer[lksdk.LocalTrack]
+	localTrack   atomic.Pointer[lksdk_output.LocalTrack]
 	stopDropping func()
 
-	closed core.Fuse
+	closed           core.Fuse
+	pipelineErr      atomic.Pointer[error]
+	latencyCaps      *gst.Caps
+	latencySampledAt time.Time
 }
 
 type sample struct {
@@ -76,8 +86,8 @@ type AudioOutput struct {
 	codec livekit.AudioCodec
 }
 
-func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputSync *utils.TrackOutputSynchronizer, statsGatherer *stats.LocalMediaStatsGatherer) (*VideoOutput, error) {
-	e, err := newVideoOutput(codec, outputSync)
+func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, statsGatherer *stats.LocalMediaStatsGatherer, eos *eosDispatcher) (*VideoOutput, error) {
+	e, err := newVideoOutput(codec, outputSync, isPlayingTooSlow, eos)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +95,8 @@ func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputS
 	e.logger = logger.GetLogger().WithValues("kind", "video", "layer", layer.Quality.String())
 
 	e.trackStatsGatherer = statsGatherer.RegisterTrackStats(fmt.Sprintf("%s.%s", stats.OutputVideo, layer.Quality.String()))
+
+	e.latencyCaps = gst.NewCapsFromString(packetLatencyCaps)
 
 	threadCount := getVideoEncoderThreadCount(layer)
 
@@ -238,8 +250,8 @@ func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputS
 	return e, nil
 }
 
-func NewAudioOutput(options *livekit.IngressAudioEncodingOptions, outputSync *utils.TrackOutputSynchronizer, statsGatherer *stats.LocalMediaStatsGatherer) (*AudioOutput, error) {
-	e, err := newAudioOutput(options.AudioCodec, outputSync)
+func NewAudioOutput(options *livekit.IngressAudioEncodingOptions, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, statsGatherer *stats.LocalMediaStatsGatherer, eos *eosDispatcher) (*AudioOutput, error) {
+	e, err := newAudioOutput(options.AudioCodec, outputSync, isPlayingTooSlow, eos)
 	if err != nil {
 		return nil, err
 	}
@@ -339,11 +351,13 @@ func NewAudioOutput(options *livekit.IngressAudioEncodingOptions, outputSync *ut
 		return nil, err
 	}
 
+	e.latencyCaps = gst.NewCapsFromString(packetLatencyCaps)
+
 	return e, nil
 }
 
-func newVideoOutput(codec livekit.VideoCodec, outputSync *utils.TrackOutputSynchronizer) (*VideoOutput, error) {
-	e, err := newOutput(outputSync)
+func newVideoOutput(codec livekit.VideoCodec, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, eos *eosDispatcher) (*VideoOutput, error) {
+	e, err := newOutput(outputSync, isPlayingTooSlow, eos)
 	if err != nil {
 		return nil, err
 	}
@@ -361,8 +375,8 @@ func newVideoOutput(codec livekit.VideoCodec, outputSync *utils.TrackOutputSynch
 	return o, nil
 }
 
-func newAudioOutput(codec livekit.AudioCodec, outputSync *utils.TrackOutputSynchronizer) (*AudioOutput, error) {
-	e, err := newOutput(outputSync)
+func newAudioOutput(codec livekit.AudioCodec, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, eos *eosDispatcher) (*AudioOutput, error) {
+	e, err := newOutput(outputSync, isPlayingTooSlow, eos)
 	if err != nil {
 		return nil, err
 	}
@@ -380,21 +394,30 @@ func newAudioOutput(codec livekit.AudioCodec, outputSync *utils.TrackOutputSynch
 	return o, nil
 }
 
-func newOutput(outputSync *utils.TrackOutputSynchronizer) (*Output, error) {
+func newOutput(outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, eos *eosDispatcher) (*Output, error) {
 	sink, err := app.NewAppSink()
 	if err != nil {
 		return nil, err
 	}
 
 	e := &Output{
-		sink:       sink,
-		outputSync: outputSync,
+		queue:            utils.NewBlockingQueue[*sample](queueCapacity),
+		sink:             sink,
+		outputSync:       outputSync,
+		isPlayingTooSlow: isPlayingTooSlow,
+		eos:              eos,
 	}
+
+	if e.eos != nil {
+		e.eos.AddListener(e.onSourceEOS)
+	}
+
+	e.start()
 
 	return e, nil
 }
 
-func (o *Output) SinkReady(localTrack *lksdk.LocalTrack) {
+func (o *Output) SinkReady(localTrack *lksdk_output.LocalTrack) {
 	o.localTrack.Store(localTrack)
 
 	if o.stopDropping != nil {
@@ -438,20 +461,19 @@ func (e *Output) handleEOS(_ *app.Sink) {
 	e.Close()
 }
 
-func (e *Output) writeSample(s *media.Sample, pts time.Duration) error {
-
+func (e *Output) writeSample(s *sample) error {
 	if e.closed.IsBroken() {
 		return io.EOF
 	}
 
 	// Synchronize the outputs before the network jitter buffer to avoid old samples stuck
 	// in the channel from increasing the whole pipeline delay.
-	drop, err := e.outputSync.WaitForMediaTime(pts)
+	drop, err := e.outputSync.WaitForMediaTime(s.ts, e.isPlayingTooSlow())
 	if err != nil {
 		return err
 	}
 	if drop {
-		e.logger.Debugw("Dropping sample", "timestamp", pts)
+		e.logger.Debugw("Dropping sample", "timestamp", s.ts)
 		e.trackStatsGatherer.PacketLost(1)
 		return nil
 	}
@@ -465,25 +487,69 @@ func (e *Output) writeSample(s *media.Sample, pts time.Duration) error {
 
 	// WriteSample seems to return successfully even if the Peer Connection disconnected.
 	// We need to return success to the caller even if the PC is disconnected to allow for reconnections
-	err = localTrack.WriteSample(*s, nil)
+	err = localTrack.WriteSample(*s.s, nil)
 	if err != nil {
 		return err
 	}
 
-	e.trackStatsGatherer.MediaReceived(int64(len(s.Data)))
+	e.trackStatsGatherer.MediaReceived(int64(len(s.s.Data)))
 
 	return nil
+}
+
+func (e *Output) start() {
+	go func() {
+		for {
+			s, err := e.queue.PopFront()
+			if err != nil {
+				// Closing
+				return
+			}
+			err = e.writeSample(s)
+			if err != nil {
+				// Store the first write error
+				e.pipelineErr.CompareAndSwap(nil, &err)
+			}
+		}
+	}()
+}
+
+func (e *Output) QueueLength() int {
+	return e.queue.QueueLength()
 }
 
 func (e *Output) Close() error {
+	e.logger.Debugw("closing output")
 
 	e.closed.Break()
 	e.outputSync.Close()
+	e.queue.Close()
 
 	return nil
 }
 
+func (e *Output) onSourceEOS() {
+	e.logger.Debugw("eos received, eventually closing queue after timeout")
+	go func() {
+		timer := time.NewTimer(eosQueueDrainTimeout)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			e.Close()
+			e.logger.Debugw("output closed on eos timeout")
+		case <-e.closed.Watch():
+			// already closed as a result of handling EOS in-band
+		}
+	}()
+}
+
 func (e *VideoOutput) handleSample(sink *app.Sink) gst.FlowReturn {
+	// Return an error if the last write failed
+	if errPtr := e.pipelineErr.Load(); errPtr != nil {
+		return errors.ErrorToGstFlowReturn(*errPtr)
+	}
+
 	// Pull the sample that triggered this callback
 	s := sink.PullSample()
 	if s == nil {
@@ -506,15 +572,27 @@ func (e *VideoOutput) handleSample(sink *app.Sink) gst.FlowReturn {
 
 	ts := time.Duration(segment.ToRunningTime(gst.FormatTime, uint64(pts)))
 
-	err := e.writeSample(&media.Sample{
-		Data:     buffer.Bytes(),
-		Duration: time.Duration(duration),
-	}, ts)
+	sample := &sample{
+		s: &media.Sample{
+			Data:     buffer.Bytes(),
+			Duration: time.Duration(duration),
+		},
+		ts: ts,
+	}
 
-	return errors.ErrorToGstFlowReturn(err)
+	e.queue.PushBack(sample)
+
+	e.observeLatency(buffer)
+
+	return gst.FlowOK
 }
 
 func (e *AudioOutput) handleSample(sink *app.Sink) gst.FlowReturn {
+	// Return an error if the last write failed
+	if errPtr := e.pipelineErr.Load(); errPtr != nil {
+		return errors.ErrorToGstFlowReturn(*errPtr)
+	}
+
 	// Pull the sample that triggered this callback
 	s := sink.PullSample()
 	if s == nil {
@@ -537,21 +615,53 @@ func (e *AudioOutput) handleSample(sink *app.Sink) gst.FlowReturn {
 
 	ts := time.Duration(segment.ToRunningTime(gst.FormatTime, uint64(pts)))
 
-	var err error
-
 	switch e.codec {
 	case livekit.AudioCodec_OPUS:
-		err = e.writeSample(&media.Sample{
-			Data:     buffer.Bytes(),
-			Duration: time.Duration(duration),
-		}, ts)
+		sample := &sample{
+			s: &media.Sample{
+				Data:     buffer.Bytes(),
+				Duration: time.Duration(duration),
+			},
+			ts: ts,
+		}
+
+		e.queue.PushBack(sample)
 	}
 
-	return errors.ErrorToGstFlowReturn(err)
+	e.observeLatency(buffer)
+
+	return gst.FlowOK
 }
 
 func getVideoEncoderThreadCount(layer *livekit.VideoLayer) uint {
 	threadCount := (int64(layer.Width)*int64(layer.Height) + int64(pixelsPerEncoderThread-1)) / int64(pixelsPerEncoderThread)
 
 	return uint(threadCount)
+}
+
+func (e *Output) observeLatency(buffer *gst.Buffer) {
+	if e.trackStatsGatherer == nil {
+		return
+	}
+
+	meta := buffer.GetReferenceTimestampMeta(e.latencyCaps)
+	if meta == nil {
+		return
+	}
+
+	ingestedAt := meta.Timestamp.AsTimestamp()
+	if ingestedAt == nil || ingestedAt.IsZero() {
+		return
+	}
+
+	now := time.Now()
+	if !e.latencySampledAt.IsZero() {
+		if since := now.Sub(e.latencySampledAt); since < latencySampleInterval {
+			return
+		}
+	}
+
+	latency := now.Sub(*ingestedAt)
+	e.trackStatsGatherer.ObserveLatency(latency)
+	e.latencySampledAt = now
 }

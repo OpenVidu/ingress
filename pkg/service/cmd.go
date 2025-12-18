@@ -17,13 +17,13 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"os/exec"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"gopkg.in/yaml.v3"
 
 	"github.com/livekit/ingress/pkg/params"
+	"github.com/livekit/ingress/pkg/utils"
 	"github.com/livekit/protocol/logger"
 )
 
@@ -48,6 +48,15 @@ func NewCmd(ctx context.Context, p *params.Params) (*exec.Cmd, error) {
 			return nil, err
 		}
 		extraParamsString = string(p)
+	}
+
+	featureFlags := ""
+	if len(p.FeatureFlags) > 0 {
+		b, err := json.Marshal(p.FeatureFlags)
+		if err != nil {
+			return nil, err
+		}
+		featureFlags = string(b)
 	}
 
 	loggingFields := ""
@@ -75,6 +84,9 @@ func NewCmd(ctx context.Context, p *params.Params) (*exec.Cmd, error) {
 	if extraParamsString != "" {
 		args = append(args, "--extra-params", extraParamsString)
 	}
+	if featureFlags != "" {
+		args = append(args, "--feature-flags", featureFlags)
+	}
 	if loggingFields != "" {
 		args = append(args, "--logging-fields", loggingFields)
 	}
@@ -84,8 +96,9 @@ func NewCmd(ctx context.Context, p *params.Params) (*exec.Cmd, error) {
 	)
 
 	cmd.Dir = "/"
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	l := utils.NewHandlerLogger(p.State.ResourceId, p.IngressId)
+	cmd.Stdout = l
+	cmd.Stderr = l
 
 	return cmd, nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2023-2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,8 @@ import (
 	"github.com/livekit/protocol/tracer"
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 const shutdownTimer = time.Second * 5
@@ -113,6 +115,27 @@ func NewService(conf *config.Config, psrpcClient rpc.IOInfoClient, bus psrpc.Mes
 			Addr:    fmt.Sprintf(":%d", conf.PrometheusPort),
 			Handler: promhttp.Handler(),
 		}
+
+		// Register default Prometheus collectors only when Prometheus is enabled
+		if err := prometheus.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})); err != nil {
+			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+				logger.Errorw("failed to register process collector", err)
+			}
+		}
+
+		// Unregister the default Go collector before registering detailed runtime metrics
+		prometheus.Unregister(prometheus.NewGoCollector())
+		if err := prometheus.Register(collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsAll))); err != nil {
+			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+				logger.Errorw("failed to register go collector", err)
+			}
+		}
+
+		if err := prometheus.Register(collectors.NewBuildInfoCollector()); err != nil {
+			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+				logger.Errorw("failed to register build info collector", err)
+			}
+		}
 	}
 
 	return s, nil
@@ -122,7 +145,7 @@ func (s *Service) HandleRTMPPublishRequest(streamKey, resourceId string) (*param
 	ctx, span := tracer.Start(context.Background(), "Service.HandleRTMPPublishRequest")
 	defer span.End()
 
-	p, err := s.handleRequest(ctx, streamKey, resourceId, livekit.IngressInput_RTMP_INPUT, nil, "", "", nil)
+	p, err := s.handleRequest(ctx, streamKey, resourceId, livekit.IngressInput_RTMP_INPUT, nil, "", "", nil, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -142,28 +165,13 @@ func (s *Service) HandleRTMPPublishRequest(streamKey, resourceId string) (*param
 	return p, stats, nil
 }
 
-func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string, ihs rpc.IngressHandlerServerImpl) (p *params.Params, ready func(mimeTypes map[types.StreamKind]string, err error) *stats.LocalMediaStatsGatherer, ended func(err error), err error) {
+func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string) (p *params.Params, ready func(mimeTypes map[types.StreamKind]string, err error) *stats.LocalMediaStatsGatherer, ended func(err error), err error) {
 	ctx, span := tracer.Start(context.Background(), "Service.HandleWHIPPublishRequest")
 	defer span.End()
 
-	p, err = s.handleRequest(ctx, streamKey, resourceId, livekit.IngressInput_WHIP_INPUT, nil, "", "", nil)
+	p, err = s.handleRequest(ctx, streamKey, resourceId, livekit.IngressInput_WHIP_INPUT, nil, "", "", nil, nil)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-
-	var rpcServer rpc.IngressHandlerServer
-	if !*p.EnableTranscoding {
-		// RPC is handled in the handler process when transcoding
-
-		rpcServer, err = rpc.NewIngressHandlerServer(ihs, s.bus)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-
-		err = RegisterIngressRpcHandlers(rpcServer, p.IngressInfo)
-		if err != nil {
-			return nil, nil, nil, err
-		}
 	}
 
 	ready = func(mimeTypes map[types.StreamKind]string, err error) *stats.LocalMediaStatsGatherer {
@@ -175,9 +183,6 @@ func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string, ihs rpc
 			p.SetStatus(livekit.IngressState_ENDPOINT_ERROR, err)
 			p.SendStateUpdate(ctx)
 
-			if !*p.EnableTranscoding {
-				DeregisterIngressRpcHandlers(rpcServer, p.IngressInfo)
-			}
 			span.RecordError(err)
 			return nil
 		}
@@ -202,6 +207,7 @@ func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string, ihs rpc
 			}
 		}
 
+		// TODO remove non transcoded stats
 		stats, err := s.sm.GetIngressMediaStats(resourceId)
 		if err != nil {
 			return nil
@@ -223,7 +229,6 @@ func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string, ihs rpc
 
 			p.SendStateUpdate(ctx)
 			s.sm.IngressEnded(p.IngressInfo.State.ResourceId)
-			DeregisterIngressRpcHandlers(rpcServer, p.IngressInfo)
 		}
 	}
 
@@ -234,7 +239,7 @@ func (s *Service) HandleURLPublishRequest(ctx context.Context, resourceId string
 	ctx, span := tracer.Start(ctx, "Service.HandleURLPublishRequest")
 	defer span.End()
 
-	p, err := s.handleRequest(ctx, "", resourceId, livekit.IngressInput_URL_INPUT, req.Info, req.WsUrl, req.Token, req.LoggingFields)
+	p, err := s.handleRequest(ctx, "", resourceId, livekit.IngressInput_URL_INPUT, req.Info, req.WsUrl, req.Token, req.FeatureFlags, req.LoggingFields)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +252,7 @@ func (s *Service) HandleURLPublishRequest(ctx context.Context, resourceId string
 	return p.IngressInfo, nil
 }
 
-func (s *Service) handleRequest(ctx context.Context, streamKey string, resourceId string, inputType livekit.IngressInput, info *livekit.IngressInfo, wsUrl string, token string, loggingFields map[string]string) (p *params.Params, err error) {
+func (s *Service) handleRequest(ctx context.Context, streamKey string, resourceId string, inputType livekit.IngressInput, info *livekit.IngressInfo, wsUrl string, token string, featureFlags map[string]string, loggingFields map[string]string) (p *params.Params, err error) {
 
 	ctx, span := tracer.Start(ctx, "Service.HandleRequest")
 	defer span.End()
@@ -287,10 +292,11 @@ func (s *Service) handleRequest(ctx context.Context, streamKey string, resourceI
 			info = resp.Info
 			wsUrl = resp.WsUrl
 			token = resp.Token
+			featureFlags = resp.FeatureFlags
 			loggingFields = resp.LoggingFields
 		}
 
-		p, err = s.handleNewPublisher(ctx, resourceId, inputType, info, wsUrl, token, loggingFields)
+		p, err = s.handleNewPublisher(ctx, resourceId, inputType, info, wsUrl, token, featureFlags, loggingFields)
 		if p != nil {
 			info = p.IngressInfo
 		}
@@ -307,10 +313,10 @@ func (s *Service) handleRequest(ctx context.Context, streamKey string, resourceI
 				}
 				return
 			}
-		} else {
-			// TODO send update even for URL ingress. We cannot do this now for backward compatibility with older livekit-server
-			s.sendUpdate(ctx, info, err)
 		}
+
+		// Send update for URL ingress as well to make sure the state gets updated even if CreateIngress fails because the ingress already exists
+		s.sendUpdate(ctx, info, err)
 
 		if info != nil {
 			logger.Infow("received ingress info", "ingressID", info.IngressId, "streamKey", info.StreamKey, "resourceID", info.State.ResourceId, "ingressInfo", params.CopyRedactedIngressInfo(info))
@@ -325,11 +331,15 @@ func (s *Service) handleRequest(ctx context.Context, streamKey string, resourceI
 	}
 }
 
-func (s *Service) handleNewPublisher(ctx context.Context, resourceId string, inputType livekit.IngressInput, info *livekit.IngressInfo, wsUrl string, token string, loggingFields map[string]string) (*params.Params, error) {
+func (s *Service) handleNewPublisher(ctx context.Context, resourceId string, inputType livekit.IngressInput, info *livekit.IngressInfo, wsUrl string, token string, featureFlags map[string]string, loggingFields map[string]string) (*params.Params, error) {
 	info.State = &livekit.IngressState{
 		Status:     livekit.IngressState_ENDPOINT_BUFFERING,
 		StartedAt:  time.Now().UnixNano(),
 		ResourceId: resourceId,
+	}
+
+	if info.Enabled != nil && !*info.Enabled {
+		return nil, ingress.ErrIngressDisabled
 	}
 
 	s.confLock.Lock()
@@ -341,7 +351,7 @@ func (s *Service) handleNewPublisher(ctx context.Context, resourceId string, inp
 	}
 
 	// This validates the ingress info
-	p, err := params.GetParams(ctx, s.psrpcClient, conf, info, wsUrl, token, "", loggingFields, nil)
+	p, err := params.GetParams(ctx, s.psrpcClient, conf, info, wsUrl, token, "", featureFlags, loggingFields, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -434,6 +444,10 @@ func (s *Service) sendUpdate(ctx context.Context, info *livekit.IngressInfo, err
 	}
 }
 
+func (s *Service) GetAvailableCPU() float64 {
+	return s.monitor.GetAvailableCPU()
+}
+
 func (s *Service) CanAccept() bool {
 	return s.monitor.CanAccept()
 }
@@ -518,6 +532,10 @@ func (s *Service) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("Healthy"))
 }
 
+func (s *Service) GetWhipProxyEnabled(ctx context.Context, featureFlags map[string]string) bool {
+	return s.conf.WHIPProxyEnabled
+}
+
 type sessionCloser func(ctx context.Context)
 
 func (p sessionCloser) CloseSession(ctx context.Context) {
@@ -544,35 +562,4 @@ func (a *localSessionAPI) GatherStats(ctx context.Context) (*ipc.MediaStats, err
 	// Return a nil stats map. Use the local gatherer in the session manager for local stats
 
 	return nil, nil
-}
-
-func RegisterIngressRpcHandlers(server rpc.IngressHandlerServer, info *livekit.IngressInfo) error {
-	if err := server.RegisterUpdateIngressTopic(info.IngressId); err != nil {
-		return err
-	}
-	if err := server.RegisterDeleteIngressTopic(info.IngressId); err != nil {
-		return err
-	}
-
-	if info.InputType == livekit.IngressInput_WHIP_INPUT {
-		if err := server.RegisterDeleteWHIPResourceTopic(info.State.ResourceId); err != nil {
-			return err
-		}
-		if err := server.RegisterICERestartWHIPResourceTopic(info.State.ResourceId); err != nil {
-			return err
-		}
-
-	}
-
-	return nil
-}
-
-func DeregisterIngressRpcHandlers(server rpc.IngressHandlerServer, info *livekit.IngressInfo) {
-	server.DeregisterUpdateIngressTopic(info.IngressId)
-	server.DeregisterDeleteIngressTopic(info.IngressId)
-
-	if info.InputType == livekit.IngressInput_WHIP_INPUT {
-		server.DeregisterDeleteWHIPResourceTopic(info.State.ResourceId)
-		server.DeregisterICERestartWHIPResourceTopic(info.State.ResourceId)
-	}
 }

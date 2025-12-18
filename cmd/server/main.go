@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v3"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/livekit/ingress/pkg/config"
@@ -33,6 +33,7 @@ import (
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/rtmp"
 	"github.com/livekit/ingress/pkg/service"
+	"github.com/livekit/ingress/pkg/utils"
 	"github.com/livekit/ingress/pkg/whip"
 	"github.com/livekit/ingress/version"
 	"github.com/livekit/protocol/livekit"
@@ -44,7 +45,7 @@ import (
 )
 
 func main() {
-	app := &cli.App{
+	cmd := &cli.Command{
 		Name:        "ingress",
 		Usage:       "LiveKit Ingress",
 		Version:     version.Version,
@@ -70,6 +71,9 @@ func main() {
 						Name: "ws-url",
 					},
 					&cli.StringFlag{
+						Name: "feature-flags",
+					},
+					&cli.StringFlag{
 						Name: "logging-fields",
 					},
 					&cli.StringFlag{
@@ -84,23 +88,23 @@ func main() {
 			&cli.StringFlag{
 				Name:    "config",
 				Usage:   "LiveKit Ingress yaml config file",
-				EnvVars: []string{"INGRESS_CONFIG_FILE"},
+				Sources: cli.EnvVars("INGRESS_CONFIG_FILE"),
 			},
 			&cli.StringFlag{
 				Name:    "config-body",
 				Usage:   "LiveKit Ingress yaml config body",
-				EnvVars: []string{"INGRESS_CONFIG_BODY"},
+				Sources: cli.EnvVars("INGRESS_CONFIG_BODY"),
 			},
 		},
 		Action: runService,
 	}
 
-	if err := app.Run(os.Args); err != nil {
-		fmt.Println(err)
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		logger.Infow("process excited", "error", err)
 	}
 }
 
-func runService(c *cli.Context) error {
+func runService(_ context.Context, c *cli.Command) error {
 	conf, err := getConfig(c, true)
 	if err != nil {
 		return err
@@ -138,12 +142,10 @@ func runService(c *cli.Context) error {
 		rtmpsrv = rtmp.NewRTMPServer()
 	}
 	if conf.WHIPPort > 0 {
-		psrpcWHIPClient, err := rpc.NewIngressHandlerClient(bus)
+		whipsrv, err = whip.NewWHIPServer(bus)
 		if err != nil {
 			return err
 		}
-
-		whipsrv = whip.NewWHIPServer(psrpcWHIPClient)
 	}
 
 	svc, err := service.NewService(conf, psrpcClient, bus, rtmpsrv, whipsrv, service.NewCmd, "")
@@ -167,7 +169,7 @@ func runService(c *cli.Context) error {
 		}
 	}
 	if whipsrv != nil {
-		err = whipsrv.Start(conf, svc.HandleWHIPPublishRequest, svc.GetHealthHandlers())
+		err = whipsrv.Start(conf, svc.HandleWHIPPublishRequest, svc.GetWhipProxyEnabled, svc.GetHealthHandlers())
 		if err != nil {
 			return err
 		}
@@ -217,7 +219,7 @@ func setupHealthHandlers(conf *config.Config, svc *service.Service) error {
 	return nil
 }
 
-func runHandler(c *cli.Context) error {
+func runHandler(_ context.Context, c *cli.Command) error {
 	conf, err := getConfig(c, false)
 	if err != nil {
 		return err
@@ -260,7 +262,7 @@ func runHandler(c *cli.Context) error {
 
 	var handler interface {
 		Kill()
-		HandleIngress(ctx context.Context, info *livekit.IngressInfo, wsUrl, token, relayToken string, loggingFields map[string]string, extraParams any) error
+		HandleIngress(ctx context.Context, info *livekit.IngressInfo, wsUrl, token, relayToken string, featureFlags map[string]string, loggingFields map[string]string, extraParams any) error
 	}
 
 	bus := psrpc.NewRedisMessageBus(rc)
@@ -275,19 +277,17 @@ func runHandler(c *cli.Context) error {
 	killChan := make(chan os.Signal, 1)
 	signal.Notify(killChan, syscall.SIGINT)
 
-	go func() {
-		sig := <-killChan
-		logger.Infow("exit requested, stopping all ingress and shutting down", "signal", sig)
-		handler.Kill()
-
-		time.Sleep(10 * time.Second)
-		// If handler didn't exit cleanly after 10s, cancel the context
-		cancel()
-	}()
-
 	wsUrl := conf.WsUrl
 	if c.String("ws-url") != "" {
 		wsUrl = c.String("ws-url")
+	}
+
+	var featureFlags map[string]string
+	if c.String("feature-flags") != "" {
+		err = json.Unmarshal([]byte(c.String("feature-flags")), &featureFlags)
+		if err != nil {
+			return err
+		}
 	}
 
 	var loggingFields map[string]string
@@ -298,7 +298,19 @@ func runHandler(c *cli.Context) error {
 		}
 	}
 
-	err = handler.HandleIngress(ctx, info, wsUrl, token, c.String("relay-token"), loggingFields, ep)
+	params.InitLogger(conf, info, loggingFields)
+
+	go func() {
+		sig := <-killChan
+		logger.Infow("exit requested, stopping all ingress and shutting down", "signal", sig)
+		handler.Kill()
+
+		time.Sleep(10 * time.Second)
+		// If handler didn't exit cleanly after 10s, cancel the context
+		cancel()
+	}()
+
+	err = handler.HandleIngress(ctx, info, wsUrl, token, c.String("relay-token"), featureFlags, loggingFields, ep)
 	return translateRetryableError(err)
 }
 
@@ -318,10 +330,10 @@ func setupHandlerRPCHandlers(conf *config.Config, handler *service.Handler, bus 
 		return err
 	}
 
-	return service.RegisterIngressRpcHandlers(rpcServer, info)
+	return utils.RegisterIngressRpcHandlers(rpcServer, info)
 }
 
-func getConfig(c *cli.Context, initialize bool) (*config.Config, error) {
+func getConfig(c *cli.Command, initialize bool) (*config.Config, error) {
 	configFile := c.String("config")
 	configBody := c.String("config-body")
 	if configBody == "" {

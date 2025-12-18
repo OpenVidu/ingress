@@ -16,7 +16,10 @@ package media
 
 import (
 	"context"
+	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/frostbyte73/core"
 	"github.com/go-gst/go-gst/gst"
@@ -31,33 +34,45 @@ import (
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/tracer"
 	putils "github.com/livekit/protocol/utils"
-	lksdk "github.com/livekit/server-sdk-go/v2"
+)
+
+const (
+	targetMinQueueLength = 2
 )
 
 type WebRTCSink struct {
 	params    *params.Params
 	onFailure func()
 
-	lock     sync.Mutex
-	sdkReady core.Fuse
-	closed   core.Fuse
-	errChan  chan error
+	lock             sync.Mutex
+	sdkReady         core.Fuse
+	closed           core.Fuse
+	errChan          chan error
+	spliceProbeAdded bool
 
-	sdkOut        *lksdk_output.LKSDKOutput
-	outputSync    *utils.OutputSynchronizer
-	statsGatherer *stats.LocalMediaStatsGatherer
+	sdkOut          *lksdk_output.LKSDKOutput
+	outputSync      *utils.OutputSynchronizer
+	spliceProcessor *SpliceProcessor
+	statsGatherer   *stats.LocalMediaStatsGatherer
+	eos             *eosDispatcher
+
+	// logging
+	tooSlowThrottle  core.Throttle
+	tooSlowLogEvents atomic.Int32
 }
 
-func NewWebRTCSink(ctx context.Context, p *params.Params, onFailure func(), statsGatherer *stats.LocalMediaStatsGatherer) (*WebRTCSink, error) {
+func NewWebRTCSink(ctx context.Context, p *params.Params, onFailure func(), statsGatherer *stats.LocalMediaStatsGatherer, eos *eosDispatcher) (*WebRTCSink, error) {
 	ctx, span := tracer.Start(ctx, "media.NewWebRTCSink")
 	defer span.End()
 
 	s := &WebRTCSink{
-		params:        p,
-		onFailure:     onFailure,
-		errChan:       make(chan error),
-		outputSync:    utils.NewOutputSynchronizer(),
-		statsGatherer: statsGatherer,
+		params:          p,
+		onFailure:       onFailure,
+		errChan:         make(chan error),
+		outputSync:      utils.NewOutputSynchronizer(),
+		statsGatherer:   statsGatherer,
+		eos:             eos,
+		tooSlowThrottle: core.NewThrottle(5 * time.Second),
 	}
 
 	go func() {
@@ -83,6 +98,7 @@ func NewWebRTCSink(ctx context.Context, p *params.Params, onFailure func(), stat
 
 		s.lock.Lock()
 		s.sdkOut = sdkOut
+		s.spliceProcessor = NewSpliceProcessor(sdkOut, s.outputSync)
 		s.lock.Unlock()
 	}()
 
@@ -90,7 +106,7 @@ func NewWebRTCSink(ctx context.Context, p *params.Params, onFailure func(), stat
 }
 
 func (s *WebRTCSink) addAudioTrack() (*Output, error) {
-	output, err := NewAudioOutput(s.params.AudioEncodingOptions, s.outputSync.AddTrack(), s.statsGatherer)
+	output, err := NewAudioOutput(s.params.AudioEncodingOptions, s.outputSync.AddTrack(), s.isPlayingTooSlow, s.statsGatherer, s.eos)
 	if err != nil {
 		logger.Errorw("could not create output", err)
 		return nil, err
@@ -121,7 +137,7 @@ func (s *WebRTCSink) addAudioTrack() (*Output, error) {
 		}
 
 		if sdkOut != nil {
-			var track *lksdk.LocalTrack
+			var track *lksdk_output.LocalTrack
 			track, err = sdkOut.AddAudioTrack(putils.GetMimeTypeForAudioCodec(s.params.AudioEncodingOptions.AudioCodec), s.params.AudioEncodingOptions.DisableDtx, s.params.AudioEncodingOptions.Channels > 1)
 			if err != nil {
 				return
@@ -136,6 +152,39 @@ func (s *WebRTCSink) addAudioTrack() (*Output, error) {
 	return output.Output, nil
 }
 
+func (s *WebRTCSink) isPlayingTooSlow() bool {
+	s.lock.Lock()
+	sdkOut := s.sdkOut
+	s.lock.Unlock()
+
+	if sdkOut == nil {
+		return false
+	}
+
+	if !s.params.Live {
+		// output back pressure sets the play rate for VOD
+		return false
+	}
+
+	o := sdkOut.GetOutputs()
+	minQueueLength := math.MaxInt
+	for _, out := range o {
+		minQueueLength = min(minQueueLength, out.QueueLength())
+	}
+
+	if minQueueLength > targetMinQueueLength {
+		s.tooSlowLogEvents.Add(1)
+
+		s.tooSlowThrottle(func() {
+			logger.Debugw("playing too slow", "minQueueLength", minQueueLength, "eventCount", s.tooSlowLogEvents.Swap(0))
+		})
+
+		return true
+	}
+
+	return false
+}
+
 func (s *WebRTCSink) addVideoTrack(w, h int) ([]*Output, error) {
 	outputs := make([]*Output, 0)
 	sbArray := make([]lksdk_output.SampleProvider, 0)
@@ -143,7 +192,7 @@ func (s *WebRTCSink) addVideoTrack(w, h int) ([]*Output, error) {
 	sortedLayers := filterAndSortLayersByQuality(s.params.VideoEncodingOptions.Layers, w, h)
 
 	for _, layer := range sortedLayers {
-		output, err := NewVideoOutput(s.params.VideoEncodingOptions.VideoCodec, layer, s.outputSync.AddTrack(), s.statsGatherer)
+		output, err := NewVideoOutput(s.params.VideoEncodingOptions.VideoCodec, layer, s.outputSync.AddTrack(), s.isPlayingTooSlow, s.statsGatherer, s.eos)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +226,7 @@ func (s *WebRTCSink) addVideoTrack(w, h int) ([]*Output, error) {
 		}
 
 		if sdkOut != nil {
-			var tracks []*lksdk.LocalTrack
+			var tracks []*lksdk_output.LocalTrack
 			var pliHandlers []*lksdk_output.RTCPHandler
 
 			tracks, pliHandlers, err = sdkOut.AddVideoTrack(sortedLayers, putils.GetMimeTypeForVideoCodec(s.params.VideoEncodingOptions.VideoCodec))
@@ -234,6 +283,9 @@ func (s *WebRTCSink) AddTrack(kind types.StreamKind, caps *gst.Caps) (*gst.Bin, 
 		bin = pp.GetBin()
 	}
 
+	if !s.spliceProbeAdded {
+		s.addSpliceProbe(bin)
+	}
 	return bin, nil
 }
 
@@ -244,6 +296,10 @@ func (s *WebRTCSink) Close() error {
 
 	var err error
 	s.lock.Lock()
+	if s.spliceProcessor != nil {
+		s.spliceProcessor.Close()
+	}
+
 	if s.sdkOut != nil {
 		err = s.sdkOut.Close()
 	}
@@ -277,6 +333,36 @@ func getResolution(caps *gst.Caps) (w int, h int, err error) {
 	}
 
 	return wObj.(int), hObj.(int), nil
+}
+
+func (s *WebRTCSink) addSpliceProbe(bin *gst.Bin) {
+	pad := bin.GetStaticPad("sink")
+	if pad == nil {
+		logger.Infow("No sink pad on output bin")
+		return
+	}
+
+	pad.SetEventFunction(func(self *gst.Pad, parent *gst.Object, event *gst.Event) bool {
+		if event.HasName("scte-sit") {
+			s.lock.Lock()
+			p := s.spliceProcessor
+			s.lock.Unlock()
+
+			if p != nil {
+				err := p.ProcessSpliceEvent(event)
+				if err != nil {
+					logger.Infow("failed processing splice event", "error", err)
+				}
+			} else {
+				// TODO store events and process them after connection
+				logger.Infow("unable to process media splice before room is connected")
+			}
+		}
+
+		return pad.EventDefault(parent, event)
+	})
+
+	s.spliceProbeAdded = true
 }
 
 func filterAndSortLayersByQuality(layers []*livekit.VideoLayer, sourceW, sourceH int) []*livekit.VideoLayer {

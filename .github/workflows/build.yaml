@@ -20,25 +20,16 @@ on:
   pull_request:
     branches: [ main ]
 env:
-  GOVERSION: "1.21.5"
-  GSTVERSION: "1.22.5"
+  GOVERSION: "1.25.0"
+  GSTVERSION: "1.26.7"
 
 jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           lfs: true
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/bin/protoc
-            ~/.cache
-          key: ingress
 
       - name: Build docker image
         run: docker build -t ingress -f ./build/ingress/Dockerfile --build-arg GOVERSION=$GOVERSION --build-arg GSTVERSION=$GSTVERSION .

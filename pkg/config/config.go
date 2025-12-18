@@ -23,6 +23,7 @@ import (
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/logger/medialogutils"
 	"github.com/livekit/protocol/redis"
 	"github.com/livekit/protocol/utils"
 	"github.com/livekit/psrpc"
@@ -66,12 +67,17 @@ type ServiceConfig struct {
 	HTTPRelayPort    int           `yaml:"http_relay_port"`
 	Logging          logger.Config `yaml:"logging"`
 	Development      bool          `yaml:"development"`
+	WHIPProxyEnabled bool          `yaml:"whip_proxy_enabled"` // If true, WHIP requests with transcoding bypassed will be handled by the SFU directly
 
 	// Used for WHIP transport
 	RTCConfig rtcconfig.RTCConfig `yaml:"rtc_config"`
 
 	// CPU costs for various ingress types
 	CPUCost CPUCostConfig `yaml:"cpu_cost"`
+
+	// Experimental config
+	// Reduces ingest e2e latency by dropping excess preroll buffers
+	EnableStreamLatencyReduction bool `yaml:"enable_stream_latency_reduction"`
 }
 
 type InternalConfig struct {
@@ -172,7 +178,7 @@ func (c *Config) InitLogger(values ...interface{}) error {
 	values = append(c.getLoggerValues(), values...)
 	l := zl.WithValues(values...)
 	logger.SetLogger(l, c.ServiceName)
-	lksdk.SetLogger(l)
+	lksdk.SetLogger(medialogutils.NewOverrideLogger(nil))
 
 	return nil
 }

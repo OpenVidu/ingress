@@ -1,6 +1,8 @@
-log_level: debug
+logging:
+  level: debug
 redis:
   address: localhost:6379
 api_key: your-api-key
 api_secret: your-api-secret
 ws_url: wss://your-livekit-url.com
+enable_stream_latency_reduction: true

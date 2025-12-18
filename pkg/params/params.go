@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,7 @@ type Params struct {
 
 	AudioEncodingOptions *livekit.IngressAudioEncodingOptions
 	VideoEncodingOptions *livekit.IngressVideoEncodingOptions
+	Live                 bool
 
 	// connection info
 	WsUrl string
@@ -66,6 +68,8 @@ type Params struct {
 	RelayUrl   string
 	RelayToken string
 	TmpDir     string
+
+	FeatureFlags map[string]string
 
 	// Input type specific private parameters
 	ExtraParams any
@@ -85,7 +89,7 @@ func InitLogger(conf *config.Config, info *livekit.IngressInfo, loggingFields ma
 
 	return nil
 }
-func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.Config, info *livekit.IngressInfo, wsUrl, token, relayToken string, loggingFields map[string]string, ep any) (*Params, error) {
+func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.Config, info *livekit.IngressInfo, wsUrl, token, relayToken string, featureFlags map[string]string, loggingFields map[string]string, ep any) (*Params, error) {
 	var err error
 
 	// The state should have been created by the service, before launching the hander, but be defensive here.
@@ -168,7 +172,7 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 	// END OPENVIDU BLOCK
 
 	if token == "" {
-		token, err = ingress.BuildIngressToken(conf.ApiKey, conf.ApiSecret, info.RoomName, info.ParticipantIdentity, info.ParticipantName, info.ParticipantMetadata)
+		token, err = ingress.BuildIngressToken(conf.ApiKey, conf.ApiSecret, info.RoomName, info.ParticipantIdentity, info.ParticipantName, info.ParticipantMetadata, info.IngressId)
 		if err != nil {
 			return nil, err
 		}
@@ -181,12 +185,14 @@ func GetParams(ctx context.Context, psrpcClient rpc.IOInfoClient, conf *config.C
 		Config:               conf,
 		AudioEncodingOptions: audioEncodingOptions,
 		VideoEncodingOptions: videoEncodingOptions,
+		Live:                 getLive(info),
 		Token:                token,
 		WsUrl:                wsUrl,
 		RelayToken:           relayToken,
 		LoggingFields:        loggingFields,
 		RelayUrl:             relayUrl,
 		TmpDir:               tmpDir,
+		FeatureFlags:         featureFlags,
 		ExtraParams:          ep,
 	}
 
@@ -207,6 +213,20 @@ func UpdateTranscodingEnabled(info *livekit.IngressInfo) {
 	default:
 		t := true
 		info.EnableTranscoding = &t
+	}
+}
+
+func getLive(info *livekit.IngressInfo) bool {
+	switch info.InputType {
+	case livekit.IngressInput_URL_INPUT:
+		if strings.HasPrefix(info.Url, "http://") || strings.HasPrefix(info.Url, "https://") {
+			return false
+		} else {
+			return true
+		}
+	default:
+		// TODO RTMP and WHIP should use the live mode but more work is needed on the pipeline sample timestamp fugding/dropping to avoid A/V sync issues
+		return false
 	}
 }
 

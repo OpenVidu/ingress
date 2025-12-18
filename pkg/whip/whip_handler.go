@@ -17,6 +17,8 @@ package whip
 import (
 	"bufio"
 	"context"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"strings"
 	"sync"
@@ -34,9 +36,11 @@ import (
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/types"
+	"github.com/livekit/ingress/pkg/utils"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/logger/pionlogger"
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/tracer"
 	putils "github.com/livekit/protocol/utils"
@@ -51,6 +55,14 @@ const (
 	maxRetryCount              = 3
 )
 
+var (
+	ignoredLogPrefixes = map[string][]string{
+		"ice": {
+			"Failed to ping without candidate pairs",
+		},
+	}
+)
+
 type WhipTrackHandler interface {
 	Start(onDone func(err error)) (err error)
 	Close()
@@ -63,8 +75,9 @@ type WhipTrackDescription struct {
 }
 
 type whipHandler struct {
-	logger logger.Logger
-	params *params.Params
+	logger    logger.Logger
+	params    *params.Params
+	rpcServer rpc.IngressHandlerServer
 
 	rtcConfig          *rtcconfig.WebRTCConfig
 	pc                 *webrtc.PeerConnection
@@ -83,23 +96,36 @@ type whipHandler struct {
 	trackSDKMediaSink     map[types.StreamKind]*SDKMediaSink
 }
 
-func NewWHIPHandler(webRTCConfig *rtcconfig.WebRTCConfig) *whipHandler {
+func NewWHIPHandler(p *params.Params, webRTCConfig *rtcconfig.WebRTCConfig, bus psrpc.MessageBus) (*whipHandler, error) {
 	// Copy the rtc conf to allow modifying to to match the request
 	rtcConfCopy := *webRTCConfig
 
-	return &whipHandler{
+	h := &whipHandler{
 		rtcConfig:         &rtcConfCopy,
+		params:            p,
+		logger:            p.GetLogger(),
 		sync:              synchronizer.NewSynchronizer(nil),
 		trackHandlers:     make(map[WhipTrackDescription]WhipTrackHandler),
 		trackSDKMediaSink: make(map[types.StreamKind]*SDKMediaSink),
 	}
+
+	var err error
+	if bus != nil {
+		h.rpcServer, err = rpc.NewIngressHandlerServer(h, bus)
+		if err != nil {
+			return nil, err
+		}
+		err = utils.RegisterIngressRpcHandlers(h.rpcServer, p.IngressInfo)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return h, nil
 }
 
-func (h *whipHandler) Init(ctx context.Context, p *params.Params, sdpOffer string) (string, error) {
+func (h *whipHandler) Init(ctx context.Context, sdpOffer string) (string, error) {
 	var err error
-
-	h.logger = p.GetLogger()
-	h.params = p
 
 	h.updateSettings()
 
@@ -113,7 +139,7 @@ func (h *whipHandler) Init(ctx context.Context, p *params.Params, sdpOffer strin
 		return "", err
 	}
 
-	if *p.EnableTranscoding && len(h.simulcastLayers) != 0 {
+	if *h.params.EnableTranscoding && len(h.simulcastLayers) != 0 {
 		return "", errors.ErrSimulcastTranscode
 	}
 
@@ -130,7 +156,7 @@ func (h *whipHandler) Init(ctx context.Context, p *params.Params, sdpOffer strin
 	// for each PeerConnection.
 	i := &interceptor.Registry{}
 
-	if *p.EnableTranscoding {
+	if *h.params.EnableTranscoding {
 		// Use the default set of Interceptors
 		if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 			return "", err
@@ -193,6 +219,9 @@ func (h *whipHandler) SetMediaStatsGatherer(st *stats.LocalMediaStatsGatherer) {
 }
 
 func (h *whipHandler) Close() {
+	if h.rpcServer != nil {
+		utils.DeregisterIngressRpcHandlers(h.rpcServer, h.params.IngressInfo)
+	}
 	if h.pc != nil {
 		h.pc.Close()
 	}
@@ -295,6 +324,10 @@ func (h *whipHandler) updateSettings() {
 	se.DisableSRTPReplayProtection(true)
 	se.DisableSRTCPReplayProtection(true)
 	se.SetDTLSRetransmissionInterval(dtlsRetransmissionInterval)
+
+	o := pionlogger.WithPrefixFilter(pionlogger.NewPrefixFilter(ignoredLogPrefixes))
+
+	se.LoggerFactory = pionlogger.NewLoggerFactory(h.logger, o)
 }
 
 func (h *whipHandler) createPeerConnection(api *webrtc.API) (*webrtc.PeerConnection, error) {
@@ -713,6 +746,11 @@ func (h *whipHandler) ICERestartWHIPResource(ctx context.Context, req *rpc.ICERe
 	_, span := tracer.Start(ctx, "whipHandler.ICERestartWHIPResource")
 	defer span.End()
 
+	if req.IfMatch != "*" {
+		h.logger.Infow("WHIP client attempted Trickle-ICE")
+		return nil, psrpc.NewErrorf(psrpc.UnprocessableEntity, "Trickle-ICE not supported")
+	}
+
 	if h.pc == nil {
 		return nil, errors.ErrIngressNotFound
 	}
@@ -759,5 +797,11 @@ func (h *whipHandler) ICERestartWHIPResource(ctx context.Context, req *rpc.ICERe
 		trickleIceSdpfrag.WriteString(l + "\n")
 	}
 
-	return &rpc.ICERestartWHIPResourceResponse{TrickleIceSdpfrag: trickleIceSdpfrag.String()}, nil
+	etag := fmt.Sprintf("%08x", crc32.ChecksumIEEE([]byte(trickleIceSdpfrag.String())))
+
+	return &rpc.ICERestartWHIPResourceResponse{TrickleIceSdpfrag: trickleIceSdpfrag.String(), Etag: etag}, nil
+}
+
+func (h *whipHandler) WHIPRTCConnectionNotify(ctx context.Context, req *rpc.WHIPRTCConnectionNotifyRequest) (*google_protobuf2.Empty, error) {
+	return &google_protobuf2.Empty{}, nil
 }
