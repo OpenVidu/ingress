@@ -121,6 +121,15 @@ func NewURLSource(ctx context.Context, p *params.Params) (*URLSource, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		printStats = func() {
+			str, _ := elem.GetProperty("stats")
+			if str != nil {
+				if v, ok := str.(*gst.Structure); ok {
+					logger.Infow("RTSP input stats", "stats", v.String())
+				}
+			}
+		}
 		// END OPENVIDU BLOCK
 
 	} else {
