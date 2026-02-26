@@ -111,6 +111,16 @@ func NewConfig(confString string) (*Config, error) {
 		}
 	}
 
+	// BEGIN OPENVIDU BLOCK
+	// Apply REDIS_PASSWORD environment variable if set
+	if redisPassword := os.Getenv("REDIS_PASSWORD"); redisPassword != "" {
+		if conf.Redis == nil {
+			conf.Redis = &redis.RedisConfig{}
+		}
+		conf.Redis.Password = redisPassword
+	}
+	// END OPENVIDU BLOCK
+
 	if conf.Redis == nil {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "redis configuration is required")
 	}
