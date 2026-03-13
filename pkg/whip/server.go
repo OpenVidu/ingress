@@ -26,13 +26,14 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
+	google_protobuf2 "google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/types"
-	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
-	google_protobuf2 "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -219,9 +220,9 @@ func (s *WHIPServer) Start(
 			RawTrickleIceSdpfrag: string(body),
 			IfMatch:              r.Header.Get("If-Match"),
 		}, psrpc.WithRequestTimeout(5*time.Second))
-		if err == psrpc.ErrNoResponse {
+		if err != nil {
 			s.handleError(err, w)
-			logger.Infow("WHIP ICE Restart failed no such session", "error", err, "streamKey", streamKey, "resourceID", resourceID)
+			logger.Infow("WHIP ICE restart failed", "error", err, "streamKey", streamKey, "resourceID", resourceID)
 			return
 		}
 
