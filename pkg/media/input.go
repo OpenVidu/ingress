@@ -97,13 +97,15 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 
 	// BEGIN OPENVIDU BLOCK
 	// We must add the rtspsrc element to the parent bin so it can later link its
-	// dynamic pads to the ghost sink pads of the video bin and audio bin
-	if strings.HasPrefix(p.Url, "rtsp://") || strings.HasPrefix(p.Url, "rtsps://") {
+	// dynamic pads to the ghost sink pads of the video bin and audio bin.
+	if urlpull.IsRTSP(p.Url) {
 		urlsource, ok := src.(*urlpull.URLSource)
 		if !ok {
 			return nil, errors.New("URL is rtsp but source is not of type URLSource")
 		}
-		bin.Add(urlsource.Rtspsrc)
+		if err := bin.Add(urlsource.Rtspsrc); err != nil {
+			return nil, err
+		}
 	}
 	// END OPENVIDU BLOCK
 
@@ -191,7 +193,7 @@ func (i *Input) Close() error {
 	return i.closeErr
 }
 
-func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
+func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 	var err error
 
 	defer func() {
@@ -206,20 +208,28 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 		var caps interface{}
 		caps, err = typefind.GetProperty("caps")
 		if err == nil && caps != nil {
-			err = i.source.ValidateCaps(caps.(*gst.Caps))
+			typedCaps := caps.(*gst.Caps)
+			err = i.source.ValidateCaps(typedCaps)
 			if err != nil {
 				logger.Infow("input caps validation failed", "error", err)
 
 				// BEGIN OPENVIDU BLOCK
-				// In some occasions the caps might be empty when using rtspsrc
-				// Simply ignore this error if this is the case
-				rtspsrcElement, rtspsrcError := i.bin.GetElementByName("rtspsrc")
-				if rtspsrcError == nil && rtspsrcElement != nil {
-					logger.Infow("Ignore validation caps as we are using rtspsrc")
-					err = nil
-				} else {
+				// rtspsrc can momentarily expose empty/unnegotiated caps at the
+				// typefind stage; ignore the validation failure ONLY in that
+				// case so the stream can still proceed. A genuinely unsupported
+				// RTSP payload (non-empty caps that fail validation) must still
+				// surface its error rather than fail opaquely downstream.
+				// NOTE: application/x-rtp is in urlpull.supportedMimeTypes, so
+				// valid RTSP streams validate cleanly and never reach here; if a
+				// future valid stream surfaces different caps, add its mime type
+				// to supportedMimeTypes instead of broadening this bypass.
+				_, rtspErr := i.bin.GetElementByName(urlpull.RtspsrcElementName)
+				if rtspErr != nil || typedCaps.GetSize() != 0 {
+					// Not the empty-caps rtspsrc case: propagate the error.
 					return
 				}
+				logger.Infow("ignoring empty caps validation failure for rtspsrc")
+				err = nil
 				// END OPENVIDU BLOCK
 			}
 		}
@@ -292,24 +302,38 @@ func (i *Input) onPadAdded(_ *gst.Element, pad *gst.Pad) {
 	}
 
 	// Gather bitrate stats & attach latency meta from the pipeline
-	i.addStatsCollectionProbe(kind)
+	// BEGIN OPENVIDU BLOCK
+	// Pass the decodebin that produced this pad so the stats probe can locate
+	// the correct internal multiqueue even when multiple decodebins exist (RTSP).
+	i.addStatsCollectionProbe(decodeBin, kind)
+	// END OPENVIDU BLOCK
 
 	if i.onOutputReady != nil {
 		i.onOutputReady(pad, kind)
 	}
 }
 
-func (i *Input) addStatsCollectionProbe(kind types.StreamKind) {
+func (i *Input) addStatsCollectionProbe(decodeBin *gst.Element, kind types.StreamKind) {
 	// Do a best effort to add probe to retrieve bitrate and ingest time metadata.
 	// Time metadata would be best ingested at the source but flv muxer doesn't support carrying it through.
 	// The multiqueue is generally created in the pipeline before the decoders
-	mq, err := i.bin.GetElementByName("multiqueue0")
 
-	if err != nil {
-		// No multiqueue in that pipeline
-		logger.Debugw("could not retrieve multiqueue element from pipeline", "error", err)
-		return
+	// BEGIN OPENVIDU BLOCK
+	// The OpenVidu RTSP path builds one decodebin per stream (audio + video), so
+	// the process-global "multiqueue0" name no longer identifies the decoder for
+	// a given kind. Locate the multiqueue inside the decodebin that produced this
+	// pad; fall back to the legacy global lookup for single-decodebin inputs.
+	mq := findDecodeMultiqueue(decodeBin)
+	if mq == nil {
+		var err error
+		mq, err = i.bin.GetElementByName("multiqueue0")
+		if err != nil {
+			// No multiqueue in that pipeline
+			logger.Debugw("could not retrieve multiqueue element from pipeline", "error", err)
+			return
+		}
 	}
+	// END OPENVIDU BLOCK
 
 	pads, err := mq.GetSinkPads()
 	if err != nil {
@@ -359,6 +383,30 @@ func (i *Input) addStatsCollectionProbe(kind types.StreamKind) {
 	logger.Debugw("no pad on multiqueue with required kind found", "kind", kind)
 }
 
+// BEGIN OPENVIDU BLOCK
+// findDecodeMultiqueue returns the internal multiqueue element of the given
+// decodebin, or nil if it has none. decodebin3 creates its multiqueue eagerly,
+// but its process-global name (multiqueue0, multiqueue1, ...) depends on
+// creation order, so we search by name prefix within the decodebin rather than
+// relying on a fixed global name (which breaks when >1 decodebin exists).
+func findDecodeMultiqueue(decodeBin *gst.Element) *gst.Element {
+	if decodeBin == nil {
+		return nil
+	}
+	elems, err := gst.ToGstBin(decodeBin).GetElementsRecursive()
+	if err != nil {
+		return nil
+	}
+	for _, e := range elems {
+		if strings.HasPrefix(e.GetName(), "multiqueue") {
+			return e
+		}
+	}
+	return nil
+}
+
+// END OPENVIDU BLOCK
+
 func shouldEnableStreamLatencyReduction(p *params.Params) bool {
 	enableGate := p.EnableStreamLatencyReduction
 	if !enableGate {
@@ -369,6 +417,16 @@ func shouldEnableStreamLatencyReduction(p *params.Params) bool {
 	if p.InputType == livekit.IngressInput_WHIP_INPUT {
 		return false
 	}
+
+	// BEGIN OPENVIDU BLOCK
+	// RTSP is ingested as two independent decodebins (separate audio/video RTP
+	// streams), like WHIP above. A common latency-reduction offset cannot be
+	// applied across independent streams, and the gate's single-source
+	// assumptions cause dropped buffers / A-V desync, so disable it for RTSP.
+	if p.InputType == livekit.IngressInput_URL_INPUT && urlpull.IsRTSP(p.Url) {
+		return false
+	}
+	// END OPENVIDU BLOCK
 
 	if p.InputType == livekit.IngressInput_URL_INPUT &&
 		(strings.HasPrefix(p.Url, "http://") || strings.HasPrefix(p.Url, "https://")) {

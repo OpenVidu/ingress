@@ -112,11 +112,8 @@ func NewConfig(confString string) (*Config, error) {
 	}
 
 	// BEGIN OPENVIDU BLOCK
-	// Apply REDIS_PASSWORD environment variable if set
-	if redisPassword := os.Getenv("REDIS_PASSWORD"); redisPassword != "" {
-		if conf.Redis == nil {
-			conf.Redis = &redis.RedisConfig{}
-		}
+	// Apply REDIS_PASSWORD environment variable if set.
+	if redisPassword := os.Getenv("REDIS_PASSWORD"); redisPassword != "" && conf.Redis != nil {
 		conf.Redis.Password = redisPassword
 	}
 	// END OPENVIDU BLOCK
@@ -124,6 +121,13 @@ func NewConfig(confString string) (*Config, error) {
 	if conf.Redis == nil {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "redis configuration is required")
 	}
+
+	// BEGIN OPENVIDU BLOCK
+	// Fail fast on an unrecognized openvidu config.
+	if err := conf.OpenVidu.Validate(); err != nil {
+		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "%s", err)
+	}
+	// END OPENVIDU BLOCK
 
 	return conf, nil
 }
