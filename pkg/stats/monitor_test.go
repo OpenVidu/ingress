@@ -20,10 +20,32 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/psrpc"
 
 	"github.com/livekit/ingress/pkg/errors"
 )
+
+// BEGIN OPENVIDU BLOCK
+// The RTMP and WHIP servers accept publishers before Service.Run starts the
+// monitor. A request in that window must be refused, not crash the process
+// (which restarted it into the same window while the publisher kept retrying).
+func TestRequestsBeforeStartAreRefused(t *testing.T) {
+	m := NewMonitor()
+	info := &livekit.IngressInfo{
+		IngressId: "IN_test",
+		InputType: livekit.IngressInput_RTMP_INPUT,
+	}
+
+	require.NotPanics(t, func() {
+		require.False(t, m.AcceptIngress(info))
+		require.False(t, m.CanAcceptIngress(info))
+		require.False(t, m.CanAccept())
+		require.Zero(t, m.GetAvailableCPU())
+	})
+}
+
+// END OPENVIDU BLOCK
 
 func TestPublicationStatus(t *testing.T) {
 	cases := []struct {

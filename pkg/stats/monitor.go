@@ -285,6 +285,12 @@ func (m *Monitor) checkCPUConfig() error {
 }
 
 func (m *Monitor) GetAvailableCPU() float64 {
+	// BEGIN OPENVIDU BLOCK
+	// No capacity before Start has set cpuStats
+	if !m.started.IsBroken() {
+		return 0
+	}
+	// END OPENVIDU BLOCK
 	return m.getAvailable(m.cpuCostConfig.MinIdleRatio)
 }
 
@@ -358,7 +364,17 @@ func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) bool {
 		time.AfterFunc(time.Second, func() { m.pendingCPUs.Sub(cpuHold) })
 	}
 
-	logger.Debugw("cpu request", "accepted", accept, "availableCPUs", available, "numCPUs", m.cpuStats.NumCPU())
+	// BEGIN OPENVIDU BLOCK
+	// cpuStats is nil until Start runs, but the RTMP and WHIP servers can accept
+	// publishers before that (see cmd/server/main.go). Dereferencing cpuStats here
+	// crashed the process.
+	var numCPUs any = "unknown"
+	if m.started.IsBroken() {
+		numCPUs = m.cpuStats.NumCPU()
+	}
+	logger.Debugw("cpu request", "accepted", accept, "availableCPUs", available, "numCPUs", numCPUs)
+	// END OPENVIDU BLOCK
+
 	return accept
 }
 
