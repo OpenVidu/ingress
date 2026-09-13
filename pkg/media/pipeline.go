@@ -53,6 +53,13 @@ type Pipeline struct {
 	closed core.Fuse
 	cancel atomic.Pointer[context.CancelFunc]
 
+	// BEGIN OPENVIDU BLOCK
+	// Claimed by the first caller of onParamsReady for each kind, so the track
+	// is built exactly once now that its caps can arrive from two places.
+	audioParamsClaimed atomic.Bool
+	videoParamsClaimed atomic.Bool
+	// END OPENVIDU BLOCK
+
 	pipelineErr chan error
 
 	eos *eosDispatcher
@@ -126,7 +133,41 @@ func (p *Pipeline) onOutputReady(pad *gst.Pad, kind types.StreamKind) {
 	_, err = pad.Connect("notify::caps", func(gPad *gst.GhostPad, _ *glib.ParamSpec) {
 		p.onParamsReady(kind, gPad)
 	})
+	if err != nil {
+		return
+	}
+
+	// BEGIN OPENVIDU BLOCK
+	// notify::caps only fires on a change, so caps already negotiated by the
+	// time we get here never reach onParamsReady: the track of that kind is
+	// never built and the ingress publishes without it, with no error anywhere.
+	// Seen in CI as an RTMP ingress that published its audio and never its
+	// video, sitting at ENDPOINT_PUBLISHING with only "input.video" stats.
+	// Reading the caps again *after* connecting closes the window in both
+	// directions: caps that landed before the handler existed are picked up
+	// here, and caps landing from now on still reach the handler. Both paths
+	// may fire; onParamsReady builds the track only for whichever is first.
+	if pad.GetCurrentCaps() != nil {
+		p.onParamsReady(kind, gst.FromGstGhostPadUnsafeNone(pad.Unsafe()))
+	}
+	// END OPENVIDU BLOCK
 }
+
+// BEGIN OPENVIDU BLOCK
+// claimParams reports whether this is the first call for the kind, so that the
+// two paths into onParamsReady cannot both build the track of one stream.
+func (p *Pipeline) claimParams(kind types.StreamKind) bool {
+	switch kind {
+	case types.Audio:
+		return p.audioParamsClaimed.CompareAndSwap(false, true)
+	case types.Video:
+		return p.videoParamsClaimed.CompareAndSwap(false, true)
+	default:
+		return true
+	}
+}
+
+// END OPENVIDU BLOCK
 
 func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 	var err error
@@ -136,6 +177,14 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 	if err != nil || caps == nil || caps.(*gst.Caps) == nil || caps.(*gst.Caps).Unsafe() == nil {
 		return
 	}
+
+	// BEGIN OPENVIDU BLOCK
+	// Claimed only once the caps are known to be real, so a notification
+	// carrying none does not spend the claim and leave the track unbuilt.
+	if !p.claimParams(kind) {
+		return
+	}
+	// END OPENVIDU BLOCK
 
 	defer func() {
 		if err != nil {
