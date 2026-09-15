@@ -23,9 +23,10 @@ import (
 	"github.com/frostbyte73/core"
 	"github.com/go-gst/go-gst/gst"
 
+	"github.com/livekit/protocol/logger"
+
 	"github.com/livekit/ingress/pkg/errors"
 	"github.com/livekit/ingress/pkg/params"
-	"github.com/livekit/protocol/logger"
 )
 
 var (
@@ -295,6 +296,24 @@ func NewURLSource(_ context.Context, p *params.Params) (*URLSource, error) {
 		}, nil
 		// END OPENVIDU BLOCK
 
+	} else if p.EnableUDPURLPull && strings.HasPrefix(p.Url, "udp://") {
+		elem, err = gst.NewElement("udpsrc")
+		if err != nil {
+			return nil, err
+		}
+		err = elem.SetProperty("uri", p.Url)
+		if err != nil {
+			return nil, err
+		}
+
+		if p.MulticastInterface != "" {
+			err = elem.SetProperty("multicast-iface", p.MulticastInterface)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// udpsrc doesn't expose a stats property, so leave printStats unset
 	} else {
 		return nil, errors.ErrUnsupportedURLFormat
 	}

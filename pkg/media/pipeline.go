@@ -16,7 +16,9 @@ package media
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +41,16 @@ var tracer = otel.Tracer("github.com/livekit/ingress/pkg/media")
 
 const (
 	creationTimeout = 10 * time.Second
+
+	// How much of the advertised duration playback may miss and still count as
+	// complete, as a percentage of it. A manifest duration is the sum of its
+	// segment durations, and the final segment can be shorter than it declares.
+	durationTolerancePercent = 5.0
+
+	// Floor under that percentage. On a short asset the percentage collapses to
+	// a few tens of milliseconds, which is narrower than the overshoot of a
+	// final segment. Unmeasured, like the percentage above it.
+	durationToleranceFloor = time.Second
 )
 
 type Pipeline struct {
@@ -63,6 +75,11 @@ type Pipeline struct {
 	pipelineErr chan error
 
 	eos *eosDispatcher
+
+	trackLock sync.Mutex
+
+	// The caps each stream kind's output was built from.
+	established map[types.StreamKind]string
 }
 
 func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGatherer) (*Pipeline, error) {
@@ -90,11 +107,15 @@ func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGat
 	}
 
 	p := &Pipeline{
-		Params:      params,
-		pipeline:    pipeline,
-		input:       input,
+		Params:   params,
+		pipeline: pipeline,
+		input:    input,
+		// SendEOS can reach the loop before Run does, so it is built here
+		// rather than on the way into the loop, and is never nil.
+		loop:        glib.NewMainLoop(glib.MainContextDefault(), false),
 		pipelineErr: make(chan error, 1),
 		eos:         newEOSDispatcher(),
+		established: make(map[types.StreamKind]string),
 	}
 
 	input.SetOnEOS(p.eos.Fire)
@@ -104,9 +125,7 @@ func New(ctx context.Context, params *params.Params, g *stats.LocalMediaStatsGat
 			(*cancel)()
 		}
 
-		if p.loop != nil {
-			p.loop.Quit()
-		}
+		p.quitLoop()
 	}, g, p.eos)
 	if err != nil {
 		return nil, err
@@ -122,8 +141,7 @@ func (p *Pipeline) onOutputReady(pad *gst.Pad, kind types.StreamKind) {
 	var err error
 	defer func() {
 		if err != nil {
-			p.SetStatus(livekit.IngressState_ENDPOINT_ERROR, err)
-			p.SendStateUpdate(context.Background())
+			p.fail(err)
 		}
 	}()
 
@@ -133,9 +151,6 @@ func (p *Pipeline) onOutputReady(pad *gst.Pad, kind types.StreamKind) {
 	_, err = pad.Connect("notify::caps", func(gPad *gst.GhostPad, _ *glib.ParamSpec) {
 		p.onParamsReady(kind, gPad)
 	})
-	if err != nil {
-		return
-	}
 
 	// BEGIN OPENVIDU BLOCK
 	// notify::caps only fires on a change, so caps already negotiated by the
@@ -147,6 +162,9 @@ func (p *Pipeline) onOutputReady(pad *gst.Pad, kind types.StreamKind) {
 	// directions: caps that landed before the handler existed are picked up
 	// here, and caps landing from now on still reach the handler. Both paths
 	// may fire; onParamsReady builds the track only for whichever is first.
+	if err != nil {
+		return
+	}
 	if pad.GetCurrentCaps() != nil {
 		p.onParamsReady(kind, gst.FromGstGhostPadUnsafeNone(pad.Unsafe()))
 	}
@@ -178,9 +196,34 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 		return
 	}
 
+	newCaps := caps.(*gst.Caps)
+
+	// The audio and video pads notify on separate GStreamer streaming threads,
+	// so this map is shared mutable state and every access takes the lock.
+	p.trackLock.Lock()
+	builtCaps, built := p.established[kind]
+	p.trackLock.Unlock()
+
+	if built {
+		// Rebuilding is not an option -- it adds a second output of the same name
+		// and cannot restructure a published track -- so the session continues on
+		// the output it has. Caps the pipeline genuinely cannot take fail
+		// negotiation downstream and surface on the bus.
+		logger.Warnw("caps renegotiated after the output was built, continuing on the existing output", nil,
+			"kind", kind, "establishedCaps", builtCaps, "newCaps", newCaps.String())
+		return
+	}
+
 	// BEGIN OPENVIDU BLOCK
-	// Claimed only once the caps are known to be real, so a notification
-	// carrying none does not spend the claim and leave the track unbuilt.
+	// The check above does not cover us: established is only written once the
+	// output is built, and onOutputReady calls this directly for caps that were
+	// already set, so that call and the notify::caps handler can both be inside
+	// that window, on different threads, and both build the track. The claim is
+	// atomic, so exactly one of them goes on. It is taken below the
+	// renegotiation check, so a later caps change is still reported there
+	// rather than swallowed here, and only once the caps are known to be real,
+	// so a notification carrying none does not spend the claim and leave the
+	// track unbuilt.
 	if !p.claimParams(kind) {
 		return
 	}
@@ -188,17 +231,18 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 
 	defer func() {
 		if err != nil {
-			p.SetStatus(livekit.IngressState_ENDPOINT_ERROR, err)
-		} else {
-			p.SetStatus(livekit.IngressState_ENDPOINT_PUBLISHING, nil)
+			p.fail(err)
+			return
 		}
+
+		p.SetStatus(livekit.IngressState_ENDPOINT_PUBLISHING, nil)
 
 		// Is it ok to send this message here? The update handler is not waiting for a response but still doing I/O.
 		// We could send this in a separate goroutine, but this would make races more likely.
 		p.SendStateUpdate(context.Background())
 	}()
 
-	bin, err := p.sink.AddTrack(kind, caps.(*gst.Caps))
+	bin, err := p.sink.AddTrack(kind, newCaps)
 	if err != nil {
 		return
 	}
@@ -207,6 +251,10 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 		logger.Errorw("could not add bin", err)
 		return
 	}
+
+	p.trackLock.Lock()
+	p.established[kind] = newCaps.String()
+	p.trackLock.Unlock()
 
 	gPad.AddProbe(gst.PadProbeTypeBlockDownstream, func(pad *gst.Pad, _ *gst.PadProbeInfo) gst.PadProbeReturn {
 		// link
@@ -221,6 +269,31 @@ func (p *Pipeline) onParamsReady(kind types.StreamKind, gPad *gst.GhostPad) {
 	})
 }
 
+// fail stops the pipeline and reports err as the session error.
+//
+// A session that cannot build one of its outputs will never publish that track,
+// and a terminal status is read downstream as the session having ended, so it
+// must not carry on running under one.
+//
+// The update goes out last, on a GStreamer streaming thread, and has no
+// deadline. Everything that ends the session has already run by then, so a
+// stalled update parks this thread alone rather than holding up the teardown.
+func (p *Pipeline) fail(err error) {
+	// Run reads this once the loop stops, so the session ends with this as its
+	// cause rather than as a clean shutdown.
+	select {
+	case p.pipelineErr <- err:
+	default:
+	}
+
+	p.SetStatus(livekit.IngressState_ENDPOINT_ERROR, err)
+
+	// SendEOS runs the full shutdown: it cancels the input and stops the loop.
+	p.SendEOS(context.Background())
+
+	p.SendStateUpdate(context.Background())
+}
+
 func (p *Pipeline) Run(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "Pipeline.Run")
 	defer span.End()
@@ -230,10 +303,17 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	p.cancel.Store(&cancel)
 
+	// Shutdown already requested: bail out before starting anything. Only the
+	// sink needs closing; New brought it up, while the input has not started
+	// and closing an unstarted one blocks.
+	if p.closed.IsBroken() {
+		logger.Infow("shutdown requested before the pipeline started")
+		return p.sink.Close()
+	}
+
 	var err error
 
 	// add watch
-	p.loop = glib.NewMainLoop(glib.MainContextDefault(), false)
 	p.pipeline.GetPipelineBus().AddWatch(p.messageWatch)
 
 	// set state to playing (this does not start the pipeline)
@@ -270,15 +350,27 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		err = sinkErr
 	}
 
-	if err == nil {
-		// Retrieve any pipeline error
-		select {
-		case err = <-p.pipelineErr:
-		default:
-		}
+	return resolveRunError(err, p.pipelineErr)
+}
+
+// resolveRunError picks what Run reports from the error the pipeline shut down
+// with and any cause recorded on the way down.
+//
+// A cancellation is how the shutdown unblocks a source that is waiting on
+// bytes, so it describes the teardown rather than what caused it. A recorded
+// cause is preferred over one. Anything else stands: a genuine input failure is
+// more upstream than anything recorded downstream of it.
+func resolveRunError(err error, recorded <-chan error) error {
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return err
 	}
 
-	return err
+	select {
+	case cause := <-recorded:
+		return cause
+	default:
+		return err
+	}
 }
 
 func (p *Pipeline) messageWatch(msg *gst.Message) bool {
@@ -286,6 +378,20 @@ func (p *Pipeline) messageWatch(msg *gst.Message) bool {
 	case gst.MessageEOS:
 		// EOS received - close and return
 		logger.Debugw("EOS received, stopping pipeline")
+
+		// This has to run before the pipeline goes to NULL, since a NULL
+		// pipeline answers no position query. A stop we asked for also ends
+		// playback early, so it says nothing about the source: skip the check
+		// then.
+		if !p.closed.IsBroken() {
+			if err := p.checkSourceComplete(); err != nil {
+				select {
+				case p.pipelineErr <- err:
+				default:
+				}
+			}
+		}
+
 		_ = p.pipeline.BlockSetState(gst.StateNull)
 		p.loop.Quit()
 		return false
@@ -327,6 +433,63 @@ func (p *Pipeline) messageWatch(msg *gst.Message) bool {
 	}
 
 	return true
+}
+
+// checkSourceComplete returns an error when EOS arrived before the source
+// played out the duration it advertises. A segment fetch that fails for good
+// arrives as an ordinary EOS, so the advertised duration is what separates a
+// truncated pull from a finished one.
+//
+// Only a source being pulled over HTTP has a duration to fall short of. Live
+// inputs are excluded by what they are rather than by the duration query
+// declining for them, because that query is answered from the timestamps that
+// have arrived: the gap it reports is pipeline latency at teardown, not
+// missing source, and it widens as a share of the whole the shorter the
+// session is. RTMP was seen answering it.
+//
+// That rules out the push inputs, and the srt:// and udp:// urls a URL pull
+// also accepts. The prefix test is the one NewURLSource selects the source
+// element with, so the two cannot disagree about what HTTP is. Naming HTTP
+// rather than the live schemes is deliberate: a scheme added later stays
+// outside the check until someone has decided it belongs there.
+//
+// Within HTTP pulls this catches HLS. A playlist declares no end, so the
+// position query is answered upstream, by what actually arrived. mp4 and
+// matroska do declare an end, so their sinks answer it instead and this
+// returns nil.
+func (p *Pipeline) checkSourceComplete() error {
+	httpPull := p.InputType == livekit.IngressInput_URL_INPUT &&
+		(strings.HasPrefix(p.Url, "http://") || strings.HasPrefix(p.Url, "https://"))
+	if !httpPull {
+		return nil
+	}
+
+	ok, d := p.pipeline.QueryDuration(gst.FormatTime)
+	if !ok || d <= 0 {
+		return nil
+	}
+
+	ok, pos := p.pipeline.QueryPosition(gst.FormatTime)
+	if !ok || pos <= 0 {
+		logger.Debugw("no position at EOS, treating the source as complete",
+			"duration", time.Duration(d))
+		return nil
+	}
+
+	duration, position := time.Duration(d), time.Duration(pos)
+	tolerance := max(
+		time.Duration(float64(duration)*durationTolerancePercent/100),
+		durationToleranceFloor,
+	)
+	if position+tolerance >= duration {
+		return nil
+	}
+
+	logger.Warnw("source ended before the end of the stream", nil,
+		"position", position, "duration", duration)
+
+	return psrpc.NewErrorf(psrpc.Unavailable,
+		"source ended after %s of %s", position, duration)
 }
 
 func (p *Pipeline) handleStreamCollectionMessage(msg *gst.Message) {
@@ -372,39 +535,56 @@ func (p *Pipeline) SendEOS(ctx context.Context) {
 	_, span := tracer.Start(ctx, "Pipeline.SendEOS")
 	defer span.End()
 
-	p.closed.Once(func() {
-		logger.Debugw("closing pipeline")
+	// Break before loading the cancel below. Run stores its cancel and then
+	// checks the fuse, so this order leaves no interleaving where Run both
+	// misses the check and has not yet stored a cancel for this to find.
+	if !p.closed.Break() {
+		return
+	}
 
-		if cancel := p.cancel.Load(); cancel != nil {
-			(*cancel)()
+	logger.Debugw("closing pipeline")
+
+	if cancel := p.cancel.Load(); cancel != nil {
+		(*cancel)()
+	}
+
+	c := make(chan struct{})
+
+	go func() {
+		err := p.pipeline.BlockSetState(gst.StateNull)
+		if err != nil {
+			logger.Errorw("failed stopping pipeline", err)
 		}
 
-		c := make(chan struct{})
+		close(c)
+	}()
 
-		go func() {
-			err := p.pipeline.BlockSetState(gst.StateNull)
-			if err != nil {
-				logger.Errorw("failed stopping pipeline", err)
-			}
+	go func() {
+		t := time.NewTimer(5 * time.Second)
 
-			close(c)
-		}()
+		select {
+		case <-c:
+			t.Stop()
+		case <-t.C:
+			// Do not set ingress in error state as we are stopping and this causes some media at the end
+			// to not be sent to the room at worse
+			logger.Errorw("pipeline frozen", psrpc.NewErrorf(psrpc.Internal, "pipeline frozen"))
+		}
 
-		go func() {
-			t := time.NewTimer(5 * time.Second)
+		p.quitLoop()
+	}()
+}
 
-			select {
-			case <-c:
-				t.Stop()
-			case <-t.C:
-				// Do not set ingress in error state as we are stopping and this causes some media at the end
-				// to not be sent to the room at worse
-				logger.Errorw("pipeline frozen", psrpc.NewErrorf(psrpc.Internal, "pipeline frozen"))
-			}
-
-			p.loop.Quit()
-		}()
-	})
+// quitLoop stops the main loop, and is safe to call before Run has started it:
+// the quit is queued on the main context and dispatched when the loop runs.
+// Calling Quit directly is not safe there, because g_main_loop_run sets
+// is_running=TRUE on entry and overwrites it. Assumes this is the only main
+// loop on the default context.
+func (p *Pipeline) quitLoop() {
+	if _, err := glib.IdleAdd(p.loop.Quit); err != nil {
+		logger.Errorw("failed to schedule loop quit, quitting directly", err)
+		p.loop.Quit()
+	}
 }
 
 func (p *Pipeline) GetGstPipelineDebugDot() string {

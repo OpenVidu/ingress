@@ -22,29 +22,27 @@ on:
     tags:
       - 'v*.*.*'
 
-env:
-  GOVERSION: "1.25.0"
-  GSTVERSION: "1.26.7"
+permissions:
+  contents: read
 
 jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/go/bin
-            ~/bin/protoc
-            ~/.cache
-          key: ${{ runner.os }}-ingress-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-ingress
+      - name: Resolve GStreamer version
+        id: gst-version
+        run: |
+          # Assign first so a failed read trips `set -e`; inside echo its exit
+          # status would be discarded and an empty version written.
+          version=$(cat .gst-version)
+          if [ -z "$version" ]; then echo ".gst-version is empty" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
         id: docker-md
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: livekit/ingress
           # generate Docker tags based on the following events/attributes
@@ -52,28 +50,20 @@ jobs:
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.25"
-
-      - name: Download Go modules
-        run: go mod download
-
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./build/ingress/Dockerfile
@@ -82,5 +72,5 @@ jobs:
           tags: ${{ steps.docker-md.outputs.tags }}
           labels: ${{ steps.docker-md.outputs.labels }}
           build-args: |
-            GOVERSION=${{ env.GOVERSION }}
-            GSTVERSION=${{ env.GSTVERSION }}
+            GSTVERSION=${{ steps.gst-version.outputs.version }}
+            SECURITY_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}

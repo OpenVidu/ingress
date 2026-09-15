@@ -24,7 +24,9 @@ import (
 	"go/build"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/livekit/mageutil"
 )
@@ -32,9 +34,9 @@ import (
 var Default = Build
 
 const (
-	imageName  = "livekit/ingress"
-	gstVersion = "1.26.7"
-	goVersion  = "1.25.0"
+	imageName      = "livekit/ingress"
+	gstVersionFile = ".gst-version"
+	composeFile    = "build/test/compose.yaml"
 )
 
 var plugins = []string{"gstreamer", "gst-plugins-base", "gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly", "gst-libav"}
@@ -120,18 +122,38 @@ func Lint() error {
 }
 
 func BuildDocker() error {
+	// Use the current day (not a per-second timestamp) so the security refresh
+	// build arg is stable within a day and Docker layer caching avoids fetching
+	// updates on every local build.
+	securityRefresh := time.Now().UTC().Format("20060102")
+
+	gstVersion, err := getGstVersion()
+	if err != nil {
+		return err
+	}
+
 	return mageutil.Run(context.Background(),
 		fmt.Sprintf("docker pull livekit/gstreamer:%s-dev", gstVersion),
 		fmt.Sprintf("docker pull livekit/gstreamer:%s-prod", gstVersion),
-		fmt.Sprintf("docker build --no-cache -t %s:latest -f build/ingress/Dockerfile --build-arg GSTVERSION=%s --build-arg GOVERSION=%s .", imageName, gstVersion, goVersion),
+		fmt.Sprintf("docker build --no-cache -t %s:latest -f build/ingress/Dockerfile --build-arg GSTVERSION=%s --build-arg SECURITY_REFRESH=%s .", imageName, gstVersion, securityRefresh),
 	)
 }
 
 func BuildDockerLinux() error {
+	// Use the current day (not a per-second timestamp) so the security refresh
+	// build arg is stable within a day and Docker layer caching avoids fetching
+	// updates on every local build.
+	securityRefresh := time.Now().UTC().Format("20060102")
+
+	gstVersion, err := getGstVersion()
+	if err != nil {
+		return err
+	}
+
 	return mageutil.Run(context.Background(),
 		fmt.Sprintf("docker pull livekit/gstreamer:%s-dev", gstVersion),
 		fmt.Sprintf("docker pull livekit/gstreamer:%s-prod", gstVersion),
-		fmt.Sprintf("docker build --no-cache --platform linux/amd64 -t %s:latest -f build/ingress/Dockerfile --build-arg GSTVERSION=%s --build-arg GOVERSION=%s .", imageName, gstVersion, goVersion),
+		fmt.Sprintf("docker build --no-cache --platform linux/amd64 -t %s:latest -f build/ingress/Dockerfile --build-arg GSTVERSION=%s --build-arg SECURITY_REFRESH=%s .", imageName, gstVersion, securityRefresh),
 	)
 }
 
@@ -141,6 +163,50 @@ func Integration(configFile string) error {
 	}
 
 	return Retest(configFile)
+}
+
+// IntegrationDocker runs the integration suite the way CI does: the suite and
+// the Redis and room server it needs, all in containers. Unlike Integration it
+// needs no local GStreamer, and it runs the same images CI runs, so a pass
+// here means the same thing a green check does.
+//
+// The config has to reach the services by their compose names, redis:6379 and
+// ws://livekit:7880, rather than localhost.
+func IntegrationDocker(configFile string) error {
+	abs, err := filepath.Abs(configFile)
+	if err != nil {
+		return err
+	}
+
+	gstVersion, err := getGstVersion()
+	if err != nil {
+		return err
+	}
+
+	env := append(os.Environ(),
+		fmt.Sprintf("INGRESS_TEST_CONFIG=%s", abs),
+		fmt.Sprintf("GSTVERSION=%s", gstVersion),
+		fmt.Sprintf("SECURITY_REFRESH=%s", time.Now().UTC().Format("20060102")),
+	)
+
+	// run leaves the services it started behind, so they are torn down here
+	// whatever the suite did.
+	defer func() {
+		down := exec.Command("docker", "compose", "-f", composeFile, "down", "-v")
+		down.Env = env
+		down.Stdout = os.Stdout
+		down.Stderr = os.Stderr
+		_ = down.Run()
+	}()
+
+	// --build because run reuses whatever image already exists, which would
+	// silently test a stale one after any source or Dockerfile change.
+	cmd := exec.Command("docker", "compose", "-f", composeFile, "run", "--build", "--rm", "test")
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
 }
 
 func Retest(configFile string) error {
@@ -186,6 +252,22 @@ func WhipClient() error {
 }
 
 // helpers
+
+// getGstVersion returns the GStreamer version pinned in .gst-version, the single source of
+// truth shared with CI and with the Dockerfiles, which take it as the GSTVERSION build arg.
+func getGstVersion() (string, error) {
+	b, err := os.ReadFile(gstVersionFile)
+	if err != nil {
+		return "", err
+	}
+
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", fmt.Errorf("%s is empty", gstVersionFile)
+	}
+
+	return v, nil
+}
 
 func getBrewPrefix() (string, error) {
 	out, err := exec.Command("brew", "--prefix").Output()
