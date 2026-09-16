@@ -50,11 +50,6 @@ var (
 
 // BEGIN OPENVIDU BLOCK
 
-// RtspsrcElementName is the GStreamer element name given to the rtspsrc element
-// created for RTSP/RTSPS ingress. It is shared so code in other packages (see
-// media.Input) can locate the element by name without duplicating the literal.
-const RtspsrcElementName = "rtspsrc"
-
 // IsRTSP reports whether url is an RTSP or RTSPS URL. The RTSP ingress path
 // builds a bespoke pipeline topology, and several call sites must agree on when
 // that topology is in use, so the predicate lives in one place.
@@ -71,6 +66,13 @@ func newQueueBin(binName, queueName string) (*gst.Bin, *gst.Element, error) {
 
 	queue, err := gst.NewElementWithName("queue2", queueName)
 	if err != nil {
+		return nil, nil, err
+	}
+	// Like the queue of the other URL sources (see NewURLSource), let bytes and
+	// time bound the queue rather than a buffer count: RTP buffers are small
+	// (about 1.2 KB), so queue2's default of 100 buffers would block the rtspsrc
+	// streaming thread on the first hiccup downstream.
+	if err := queue.SetProperty("max-size-buffers", uint(0)); err != nil {
 		return nil, nil, err
 	}
 	if err := bin.Add(queue); err != nil {
@@ -97,10 +99,9 @@ func newQueueBin(binName, queueName string) (*gst.Bin, *gst.Element, error) {
 }
 
 // drainToFakesink links pad into a new fakesink added to the same bin as src
-// (the element that owns pad). It is used to absorb a surplus rtspsrc stream —
-// e.g. a second audio or video track we do not ingest — so rtspsrc does not
-// stall with not-linked flow errors on the dangling pad. Returns false if the
-// fakesink could not be created, added and linked.
+// (the element that owns pad). It absorbs an rtspsrc stream we do not ingest,
+// so rtspsrc does not stall with not-linked flow errors on the dangling pad.
+// Returns false if the fakesink could not be created, added and linked.
 func drainToFakesink(src *gst.Element, pad *gst.Pad) bool {
 	parent := src.GetParent()
 	if parent == nil {
@@ -115,6 +116,14 @@ func drainToFakesink(src *gst.Element, pad *gst.Pad) bool {
 	if err != nil {
 		return false
 	}
+	// A drain must never hold the pipeline up: no clock sync, and no async
+	// state change that would make the running pipeline wait for its preroll.
+	if err := fakesink.SetProperty("sync", false); err != nil {
+		return false
+	}
+	if err := fakesink.SetProperty("async", false); err != nil {
+		return false
+	}
 	if err := parentBin.Add(fakesink); err != nil {
 		return false
 	}
@@ -127,6 +136,58 @@ func drainToFakesink(src *gst.Element, pad *gst.Pad) bool {
 		return false
 	}
 	return pad.Link(sinkPads[0]) == gst.PadLinkOK
+}
+
+// rtspStreamPolicy decides which of the streams announced in the RTSP SDP are
+// set up. rtspsrc emits select-stream once per media before SETUP and skips the
+// stream when the handler returns false, so nothing is received for it and no
+// pad ever appears. The ingress publishes one audio and one video track, so the
+// first stream of each kind is taken and everything else is declined: a second
+// stream of a kind, ONVIF metadata (media "application"), backchannel audio.
+// Declining beats draining: no bandwidth is spent and no pad is left to link.
+type rtspStreamPolicy struct {
+	mu       sync.Mutex
+	accepted map[string]bool
+}
+
+func newRTSPStreamPolicy() *rtspStreamPolicy {
+	return &rtspStreamPolicy{accepted: make(map[string]bool)}
+}
+
+// accept reports whether a stream of the given media kind is set up, and
+// records it so the next stream of that kind is declined.
+func (p *rtspStreamPolicy) accept(media string) bool {
+	if media != "audio" && media != "video" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.accepted[media] {
+		return false
+	}
+	p.accepted[media] = true
+	return true
+}
+
+// rtspStreamDescription reads the media kind and the encoding name from RTP
+// caps ("application/x-rtp, media=(string)video, encoding-name=(string)H264,
+// ..."), as rtspsrc builds them from the SDP. Either is empty when missing;
+// nil caps, or caps wrapping a NULL pointer, yield two empty strings.
+func rtspStreamDescription(caps *gst.Caps) (media, encodingName string) {
+	if caps == nil || caps.Unsafe() == nil || caps.GetSize() == 0 {
+		return "", ""
+	}
+	s := caps.GetStructureAt(0)
+	if s == nil {
+		return "", ""
+	}
+	if v, err := s.GetValue("media"); err == nil {
+		media, _ = v.(string)
+	}
+	if v, err := s.GetValue("encoding-name"); err == nil {
+		encodingName, _ = v.(string)
+	}
+	return media, encodingName
 }
 
 // END OPENVIDU BLOCK
@@ -183,7 +244,7 @@ func NewURLSource(_ context.Context, p *params.Params) (*URLSource, error) {
 
 		// BEGIN OPENVIDU BLOCK
 	} else if IsRTSP(p.Url) {
-		elem, err = gst.NewElementWithName("rtspsrc", RtspsrcElementName)
+		elem, err = gst.NewElementWithName("rtspsrc", "rtspsrc")
 		if err != nil {
 			return nil, err
 		}
@@ -215,35 +276,34 @@ func NewURLSource(_ context.Context, p *params.Params) (*URLSource, error) {
 			return nil, err
 		}
 
-		// pad-added fires on rtspsrc's streaming thread as each RTP stream is
-		// negotiated. Serialize with mu so concurrent audio/video pads do not
-		// race on the shared bins.
+		// select-stream fires once per media announced in the SDP, before
+		// SETUP. Take the first audio and the first video stream and decline
+		// the rest, so surplus or foreign streams are never set up at all.
+		policy := newRTSPStreamPolicy()
+		if _, err = elem.Connect("select-stream", func(_ *gst.Element, num uint, caps *gst.Caps) bool {
+			media, encodingName := rtspStreamDescription(caps)
+			accepted := policy.accept(media)
+			logger.Infow("rtsp stream announced", "stream", num, "media", media, "encodingName", encodingName, "accepted", accepted)
+			return accepted
+		}); err != nil {
+			return nil, err
+		}
+
+		// pad-added fires on rtspsrc's streaming thread as each selected RTP
+		// stream starts. Serialize with mu so concurrent audio/video pads do
+		// not race on the shared bins. Whatever cannot be linked is drained
+		// into a fakesink: a pad rtspsrc leaves unlinked stalls the source
+		// with not-linked flow errors.
 		var mu sync.Mutex
 		if _, err = elem.Connect("pad-added", func(src *gst.Element, pad *gst.Pad) {
 			padName := pad.GetName()
-			logger.Infow("rtspsrc pad-added", "padName", padName)
+			// GetCurrentCaps can return nil for a pad added before its caps
+			// are negotiated; rtspStreamDescription tolerates that.
+			media, encodingName := rtspStreamDescription(pad.GetCurrentCaps())
+			logger.Infow("rtspsrc pad-added", "padName", padName, "media", media, "encodingName", encodingName)
 
-			// Guard against a pad added before its caps are negotiated:
-			// GetCurrentCaps() can return nil, and ForEach on a nil caps would
-			// panic on this streaming thread and crash the process.
-			caps := pad.GetCurrentCaps()
-			if caps == nil {
-				logger.Errorw("rtspsrc pad has no current caps", nil, "padName", padName)
-				return
-			}
-
-			var media string
-			caps.ForEach(func(_ *gst.CapsFeatures, structure *gst.Structure) bool {
-				value, getMediaErr := structure.GetValue("media")
-				if getMediaErr != nil {
-					return true // keep scanning the remaining structures
-				}
-				if s, ok := value.(string); ok {
-					media = s
-					return false // found the media type, stop iterating
-				}
-				return true
-			})
+			mu.Lock()
+			defer mu.Unlock()
 
 			var targetBin *gst.Bin
 			var targetQueue *gst.Element
@@ -252,33 +312,24 @@ func NewURLSource(_ context.Context, p *params.Params) (*URLSource, error) {
 				targetBin, targetQueue = audioBin, audioQueue
 			case "video":
 				targetBin, targetQueue = videoBin, videoQueue
-			default:
-				logger.Errorw("rtspsrc pad is neither audio nor video", nil, "padName", padName, "media", media)
-				return
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-
-			sinkPad := targetBin.GetStaticPad("sink")
-			if sinkPad == nil {
-				logger.Errorw("failed to get target bin sink pad", nil, "media", media)
-				return
+			var sinkPad *gst.Pad
+			if targetBin != nil {
+				sinkPad = targetBin.GetStaticPad("sink")
 			}
-
-			if sinkPad.IsLinked() {
-				// The source is sending more than one stream of this kind; we
-				// only ingest the first. Drain the surplus pad into a fakesink so
-				// rtspsrc does not stall with not-linked flow errors on it.
-				logger.Warnw("target sink already linked; draining extra stream to fakesink", nil, "media", media, "padName", padName)
+			if sinkPad == nil || sinkPad.IsLinked() {
+				// Not audio or video, no caps yet, or a second stream of a kind
+				// that select-stream should have declined: nothing to ingest.
+				logger.Warnw("rtspsrc pad not ingested, draining it to a fakesink", nil, "padName", padName, "media", media)
 				if !drainToFakesink(src, pad) {
-					logger.Errorw("failed to drain extra rtspsrc pad to fakesink", nil, "media", media, "padName", padName)
+					logger.Errorw("failed to drain rtspsrc pad to fakesink", nil, "padName", padName, "media", media)
 				}
 				return
 			}
 
 			if ret := pad.Link(sinkPad); ret != gst.PadLinkOK && ret != gst.PadLinkWasLinked {
-				logger.Errorw("failed to link rtspsrc pad", nil, "media", media, "padLinkReturnValue", ret)
+				logger.Errorw("failed to link rtspsrc pad", nil, "padName", padName, "media", media, "padLinkReturnValue", ret)
 				return
 			}
 			targetQueue.SyncStateWithParent()

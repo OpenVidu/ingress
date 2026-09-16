@@ -450,6 +450,9 @@ func CopyRedactedIngressInfo(info *livekit.IngressInfo) *livekit.IngressInfo {
 	infoCopy := protoutils.CloneProto(info)
 
 	infoCopy.StreamKey = protoutils.RedactIdentifier(infoCopy.StreamKey)
+	// BEGIN OPENVIDU BLOCK
+	infoCopy.Url = redactURLUserinfo(infoCopy.Url)
+	// END OPENVIDU BLOCK
 
 	return infoCopy
 }

@@ -1,7 +1,13 @@
 // BEGIN OPENVIDU BLOCK
 package openviduproconfig
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+)
 
 // RtcEngine selects the WebRTC engine.
 // NOTE: this setting is currently informational only
@@ -74,10 +80,52 @@ func (c RtspConfig) PortRangeOrDefault() string {
 func (c OpenViduProConfig) Validate() error {
 	switch c.Rtc.Engine {
 	case "", RtcEnginePion, RtcEngineMediasoup:
-		return nil
 	default:
 		return fmt.Errorf("invalid openvidu rtc engine %q (expected %q or %q)", c.Rtc.Engine, RtcEnginePion, RtcEngineMediasoup)
 	}
+	return c.Rtsp.Validate()
+}
+
+// Validate checks the rtspsrc tunables at startup, before they reach the
+// element, where a bad value would only surface at the first RTSP pull: as an
+// obscure property error for the latency, or as a warning and an ignored
+// setting for the port range.
+func (c RtspConfig) Validate() error {
+	if c.LatencyMs != nil && *c.LatencyMs > math.MaxUint32 {
+		return fmt.Errorf("invalid openvidu.rtsp.latency_ms %d (must fit in 32 bits)", *c.LatencyMs)
+	}
+	if c.PortRange != "" {
+		if err := validatePortRange(c.PortRange); err != nil {
+			return fmt.Errorf("invalid openvidu.rtsp.port_range %q: %w", c.PortRange, err)
+		}
+	}
+	return nil
+}
+
+// validatePortRange accepts rtspsrc's "min-max" syntax with 0 < min <= max <=
+// 65535, and the "0-0" that stands for no restriction. Each UDP stream takes an
+// RTP/RTCP port pair from the range, so a range for audio and video needs at
+// least four ports; that is left to the operator.
+func validatePortRange(s string) error {
+	minStr, maxStr, ok := strings.Cut(s, "-")
+	if !ok {
+		return errors.New("expected min-max")
+	}
+	min, err := strconv.ParseUint(minStr, 10, 16)
+	if err != nil {
+		return fmt.Errorf("min port: %w", err)
+	}
+	max, err := strconv.ParseUint(maxStr, 10, 16)
+	if err != nil {
+		return fmt.Errorf("max port: %w", err)
+	}
+	if min == 0 && max == 0 {
+		return nil
+	}
+	if min == 0 || min > max {
+		return errors.New("expected 0 < min <= max")
+	}
+	return nil
 }
 
 // END OPENVIDU BLOCK

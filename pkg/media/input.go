@@ -204,33 +204,26 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 	}()
 
 	typefind, err := i.bin.GetElementByName("typefind")
+	// BEGIN OPENVIDU BLOCK
+	// That lookup recurses through the whole input bin, and every decodebin3
+	// owns a child named "typefind" (inside its parsebin). With one decodebin
+	// per source, as the RTSP path and WHIP transcoding have, it can return the
+	// typefind of the *other* stream, whose caps may still be NULL: go-gst
+	// wraps those as a non-nil *gst.Caps of size 0 and the validation fails for
+	// a stream that is fine. Validate the stream that produced this pad instead:
+	// its typefind lives inside decodeBin.
+	if tf := findDecodeTypefind(decodeBin); tf != nil {
+		typefind, err = tf, nil
+	}
+	// END OPENVIDU BLOCK
 	if err == nil && typefind != nil {
 		var caps interface{}
 		caps, err = typefind.GetProperty("caps")
 		if err == nil && caps != nil {
-			typedCaps := caps.(*gst.Caps)
-			err = i.source.ValidateCaps(typedCaps)
+			err = i.source.ValidateCaps(caps.(*gst.Caps))
 			if err != nil {
 				logger.Infow("input caps validation failed", "error", err)
-
-				// BEGIN OPENVIDU BLOCK
-				// rtspsrc can momentarily expose empty/unnegotiated caps at the
-				// typefind stage; ignore the validation failure ONLY in that
-				// case so the stream can still proceed. A genuinely unsupported
-				// RTSP payload (non-empty caps that fail validation) must still
-				// surface its error rather than fail opaquely downstream.
-				// NOTE: application/x-rtp is in urlpull.supportedMimeTypes, so
-				// valid RTSP streams validate cleanly and never reach here; if a
-				// future valid stream surfaces different caps, add its mime type
-				// to supportedMimeTypes instead of broadening this bypass.
-				_, rtspErr := i.bin.GetElementByName(urlpull.RtspsrcElementName)
-				if rtspErr != nil || typedCaps.GetSize() != 0 {
-					// Not the empty-caps rtspsrc case: propagate the error.
-					return
-				}
-				logger.Infow("ignoring empty caps validation failure for rtspsrc")
-				err = nil
-				// END OPENVIDU BLOCK
+				return
 			}
 		}
 	}
@@ -390,6 +383,20 @@ func (i *Input) addStatsCollectionProbe(decodeBin *gst.Element, kind types.Strea
 // creation order, so we search by name prefix within the decodebin rather than
 // relying on a fixed global name (which breaks when >1 decodebin exists).
 func findDecodeMultiqueue(decodeBin *gst.Element) *gst.Element {
+	return findDecodeElement(decodeBin, "multiqueue")
+}
+
+// findDecodeTypefind returns the typefind element of the given decodebin (the
+// one its parsebin runs on the input stream), or nil if it has none. Every
+// decodebin3 has one and they all share the name "typefind", so a by-name
+// lookup from the pipeline is ambiguous as soon as there are two decodebins.
+func findDecodeTypefind(decodeBin *gst.Element) *gst.Element {
+	return findDecodeElement(decodeBin, "typefind")
+}
+
+// findDecodeElement returns the first element inside decodeBin whose name
+// starts with prefix, or nil.
+func findDecodeElement(decodeBin *gst.Element, prefix string) *gst.Element {
 	if decodeBin == nil {
 		return nil
 	}
@@ -398,7 +405,7 @@ func findDecodeMultiqueue(decodeBin *gst.Element) *gst.Element {
 		return nil
 	}
 	for _, e := range elems {
-		if strings.HasPrefix(e.GetName(), "multiqueue") {
+		if strings.HasPrefix(e.GetName(), prefix) {
 			return e
 		}
 	}
