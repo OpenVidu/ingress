@@ -15,6 +15,11 @@
 name: Test
 on:
   workflow_dispatch:
+  # BEGIN OPENVIDU BLOCK
+  # The fork's active branch: v<upstream release>-<upstream commit>
+  push:
+    branches: [ 'v[0-9]+.[0-9]+.[0-9]+-*' ]
+  # END OPENVIDU BLOCK
   pull_request:
     branches: [ main ]
 
@@ -23,7 +28,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: namespace-profile-8vcpu-cache
+    # BEGIN OPENVIDU BLOCK
+    # Upstream's namespace-profile-8vcpu-cache is a runner of LiveKit's organization
+    runs-on: ubuntu-latest
+    # END OPENVIDU BLOCK
 
     steps:
       # This job builds the test image, and that image builds the WHIP
