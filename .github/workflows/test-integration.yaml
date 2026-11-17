@@ -15,6 +15,11 @@
 name: Integration Test
 on:
   workflow_dispatch:
+  # BEGIN OPENVIDU BLOCK
+  # The fork's active branch: v<upstream release>-<upstream commit>
+  push:
+    branches: [ 'v[0-9]+.[0-9]+.[0-9]+-*' ]
+  # END OPENVIDU BLOCK
   pull_request:
     branches: [ main ]
     # Everything the test image is built from. A change to any of these can

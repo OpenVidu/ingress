@@ -42,7 +42,7 @@ import (
 func TestRequestsBeforeStartAreRefused(t *testing.T) {
 	m := NewMonitor()
 	info := &livekit.IngressInfo{
-		IngressId: "IN_test",
+		IngressId: "IN_before_start",
 		InputType: livekit.IngressInput_RTMP_INPUT,
 	}
 
