@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG LINT_VERSION=v2.11.3
+# Must be a release built with a Go toolchain at least as new as .go-version.
+# The image type-checks with the Go it was compiled with, and an older binary
+# panics ("file requires newer Go version"). v2.13.0 is the first release
+# built with Go 1.27.
+ARG LINT_VERSION=v2.14.0
 
 # The GStreamer version is pinned in .gst-version, the single source of truth that
 # Renovate keeps current via an approvable PR. It has no default here on purpose: a
@@ -71,6 +75,17 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,target=/go/build-cache \
     go build -o /usr/local/bin/ingress ./cmd/server && \
     go test -c -tags integration -o test.test ./test/
+
+# The WHIP publisher. It is its own module, vendored as the livekit-whip-bot
+# submodule, and it encodes with libx264 and libopus through cgo, both of which
+# the GStreamer image already carries. Installing it on PATH is what lets the
+# suite find it from either working directory.
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/go/build-cache \
+    test -f test/livekit-whip-bot/go.mod || \
+        { echo "test/livekit-whip-bot is empty: git submodule update --init" >&2; exit 1; } && \
+    cd test/livekit-whip-bot && \
+    go build -o /usr/local/bin/whip-client ./cmd/whip-client
 
 FROM golangci/golangci-lint:${LINT_VERSION} AS golangci
 

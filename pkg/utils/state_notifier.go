@@ -24,12 +24,16 @@ import (
 )
 
 type StateNotifier interface {
+	// IngressCreated announces a URL pull session whose ingress was just
+	// created with its first state, as that state's update would.
+	IngressCreated(ctx context.Context, projectID string, info *livekit.IngressInfo) error
+
 	UpdateIngressState(ctx context.Context, projectID string, info *livekit.IngressInfo) error
 
 	// SessionStarted reports that a session is running. It does not mark the
-	// first the notifier hears of one: a session is announced by its first
-	// state update, which carries ENDPOINT_BUFFERING and is sent before this
-	// call on every path. What this marks is the point from which the session
+	// first the notifier hears of one: a session is announced by IngressCreated
+	// or its first state update, which carry ENDPOINT_BUFFERING and are sent
+	// before this call on every path. What this marks is the point from which the session
 	// is live, so anything an implementation meters belongs between here and
 	// SessionEnded rather than from whenever an update first arrived.
 	SessionStarted(ctx context.Context, projectID string, info *livekit.IngressInfo)
@@ -50,6 +54,10 @@ func NewServiceStateNotifier(psrpcClient rpc.IOInfoClient) StateNotifier {
 	return &serviceStateNotifier{
 		psrpcClient: psrpcClient,
 	}
+}
+
+func (sn *serviceStateNotifier) IngressCreated(ctx context.Context, projectID string, info *livekit.IngressInfo) error {
+	return sn.UpdateIngressState(ctx, projectID, info)
 }
 
 func (sn *serviceStateNotifier) UpdateIngressState(ctx context.Context, _ string, info *livekit.IngressInfo) error {
@@ -78,6 +86,11 @@ func NewHandlerStateNotifier(ipcClient ipc.IngressServiceClient) StateNotifier {
 	}
 }
 
+// Handlers are started for an ingress that already exists.
+func (sn *handlerStateNotifier) IngressCreated(context.Context, string, *livekit.IngressInfo) error {
+	return nil
+}
+
 func (sn *handlerStateNotifier) UpdateIngressState(ctx context.Context, projectID string, info *livekit.IngressInfo) error {
 	req := &ipc.UpdateIngressStateRequest{
 		ProjectId: projectID,
@@ -97,6 +110,10 @@ type noopStateNotifier struct {
 
 func NewNoopStateNotifier() StateNotifier {
 	return &noopStateNotifier{}
+}
+
+func (sn *noopStateNotifier) IngressCreated(_ context.Context, _ string, _ *livekit.IngressInfo) error {
+	return nil
 }
 
 func (sn *noopStateNotifier) UpdateIngressState(_ context.Context, _ string, _ *livekit.IngressInfo) error {

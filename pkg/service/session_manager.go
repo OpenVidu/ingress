@@ -16,6 +16,7 @@ package service
 
 import (
 	"context"
+	"os"
 	"sync"
 
 	"github.com/livekit/protocol/livekit"
@@ -71,7 +72,39 @@ func (sm *SessionManager) IngressStarted(info *livekit.IngressInfo, sessionAPI t
 	sm.monitor.IngressStarted(info)
 }
 
+// HandlerStarted attributes the handler process pid to the session in info.
+func (sm *SessionManager) HandlerStarted(info *livekit.IngressInfo, pid int) {
+	sm.monitor.HandlerStarted(info, pid)
+}
+
+// HandlerExited records the run of the exited handler process pid.
+func (sm *SessionManager) HandlerExited(pid int, state *os.ProcessState) {
+	sm.monitor.HandlerExited(pid, state)
+}
+
+// HandlerStateUpdated records the input tracks a handler reported for the
+// session in info.
+func (sm *SessionManager) HandlerStateUpdated(info *livekit.IngressInfo) {
+	sm.monitor.HandlerStateUpdated(info)
+}
+
 func (sm *SessionManager) IngressEnded(resourceID string) {
+	if u := sm.monitor.SessionEnded(resourceID); u != nil {
+		logger.Infow("ingress metrics",
+			"ingressID", u.IngressID,
+			"resourceID", resourceID,
+			"inputType", u.InputType.String(),
+			"transcoding", u.Transcoding,
+			"audioMimeType", u.AudioMimeType,
+			"videoMimeType", u.VideoMimeType,
+			"avgCPU", u.AvgCPU(),
+			"maxCPU", u.MaxCPU,
+			"maxMemory", u.MaxMemory,
+			"cpuSeconds", u.CPUTime.Seconds(),
+			"durationSeconds", u.Duration.Seconds(),
+		)
+	}
+
 	sm.lock.Lock()
 	defer sm.lock.Unlock()
 

@@ -117,7 +117,7 @@ func Test() error {
 }
 
 func Lint() error {
-	return run("go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3",
+	return run("go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0",
 		"golangci-lint run --timeout=5m")
 }
 
@@ -215,6 +215,11 @@ func Retest(configFile string) error {
 		return err
 	}
 
+	binDir, err := goBinDir()
+	if err != nil {
+		return err
+	}
+
 	cmd := exec.Command("go", "test", "-v", "-count=1", "--tags=integration", "./test/...")
 
 	brewPrefix, err := getBrewPrefix()
@@ -237,7 +242,10 @@ func Retest(configFile string) error {
 		return err
 	}
 
-	cmd.Env = append(os.Environ(), sb.String(), "GST_DEBUG=3", fmt.Sprintf("INGRESS_CONFIG_BODY=%s", string(confStr)))
+	// The suite looks whip-client up on PATH, and WhipClient installed it here.
+	cmd.Env = append(os.Environ(), sb.String(), "GST_DEBUG=3",
+		fmt.Sprintf("PATH=%s%c%s", binDir, os.PathListSeparator, os.Getenv("PATH")),
+		fmt.Sprintf("INGRESS_CONFIG_BODY=%s", string(confStr)))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -247,8 +255,49 @@ func Publish(ingressId string) error {
 	return run(fmt.Sprintf("gst-launch-1.0 -v flvmux name=mux ! rtmp2sink location=rtmp://localhost:1935/live/%s  audiotestsrc freq=200 ! faac ! mux.  videotestsrc pattern=ball is-live=true ! video/x-raw,width=1280,height=720 ! x264enc speed-preset=3 ! mux.", ingressId))
 }
 
+// WhipClient installs the WHIP publisher into GOPATH/bin, which is where Retest
+// puts on PATH for the suite to find it. The image installs it on PATH too.
 func WhipClient() error {
-	return run("go build -C ./test/livekit-whip-bot/cmd/whip-client/ ./...")
+	bin, err := goBinDir()
+	if err != nil {
+		return err
+	}
+
+	// runArgs rather than run: the output path is a directory from the
+	// environment, and run splits its command on spaces.
+	return runArgs("go", "build", "-C", "./test/livekit-whip-bot",
+		"-o", filepath.Join(bin, "whip-client"), "./cmd/whip-client")
+}
+
+// goBinDir is where go build installs a tool, GOBIN when it is set and
+// GOPATH/bin otherwise.
+//
+// The two are queried separately because `go env A B` prints an empty line for
+// an unset variable, and splitting that on whitespace drops the line rather
+// than the value, so GOPATH arrives where GOBIN was expected.
+func goBinDir() (string, error) {
+	ctx := context.Background()
+
+	gobin, err := mageutil.Out(ctx, "go env GOBIN")
+	if err != nil {
+		return "", err
+	}
+	if dir := strings.TrimSpace(string(gobin)); dir != "" {
+		return dir, nil
+	}
+
+	gopath, err := mageutil.Out(ctx, "go env GOPATH")
+	if err != nil {
+		return "", err
+	}
+
+	// GOPATH is a list, and a tool is installed under its first entry.
+	dir, _, _ := strings.Cut(strings.TrimSpace(string(gopath)), string(os.PathListSeparator))
+	if dir == "" {
+		return "", fmt.Errorf("neither GOBIN nor GOPATH is set")
+	}
+
+	return filepath.Join(dir, "bin"), nil
 }
 
 // helpers

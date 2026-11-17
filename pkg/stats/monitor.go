@@ -16,6 +16,7 @@ package stats
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -36,7 +37,31 @@ import (
 
 const (
 	defaultMinIdle float64 = 0.3 // Target at least 30% idle CPU
+
+	promNamespace        = "livekit"
+	promSubsystemIngress = "ingress"
+	promLabelNodeID      = "node_id"
+	promLabelType        = "type"
+	promLabelTranscoding = "transcoding"
+	promLabelMedia       = "media"
+
+	typeLabelRTMP   = "rtmp"
+	typeLabelWHIP   = "whip"
+	typeLabelURL    = "url"
+	mediaLabelAudio = "audio"
+	mediaLabelVideo = "video"
+	mediaLabelAV    = "av"
+	labelUnknown    = "unknown"
+
+	publicationStatusSuccess  = "success"
+	publicationStatus4xx      = "4xx"
+	publicationStatus5xx      = "5xx"
+	publicationStatusInternal = "internal"
 )
+
+// promSessionCPUBuckets has edges at the default admission costs (2 and 4
+// cores), so the share of sessions above a cost reads from one bucket.
+var promSessionCPUBuckets = []float64{0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16}
 
 type Monitor struct {
 	costConfigLock sync.Mutex
@@ -48,16 +73,96 @@ type Monitor struct {
 	promNodeAvailable      prometheus.GaugeFunc
 	promPublicationCounter *prometheus.CounterVec
 
-	cpuStats *hwstats.CPUStats
+	// session metrics are observed once per session when it ends, labeled by
+	// input kind and the media the source carried
+	promSessionMaxCPU  *prometheus.HistogramVec
+	promSessionAvgCPU  *prometheus.HistogramVec
+	promSessionPeakCPU *prometheus.GaugeVec
+
+	// cpuStats (cgroup idle) drives admission; procStats only attributes usage to handler processes.
+	// TODO: use one sampler once admission is validated against per-process idle, which misses sub-second processes.
+	cpuStats  *hwstats.CPUStats
+	procStats *hwstats.CPUStats
 
 	pendingCPUs atomic.Float64
+
+	usageLock sync.Mutex
+	usage     map[string]*SessionUsage // resourceID -> usage
+	handlers  map[int]*handlerRun      // live handler pid -> run
+	peaks     map[string]float64       // type|media -> highest MaxCPU observed
 
 	started  core.Fuse
 	shutdown core.Fuse
 }
 
+// SessionUsage is the resource usage of all handler processes run for one session.
+type SessionUsage struct {
+	IngressID   string
+	ResourceID  string
+	InputType   livekit.IngressInput
+	Transcoding bool
+
+	// Mime types of the input tracks the handler reported, empty until the
+	// source has been parsed. A session that ends before then leaves both
+	// empty, which is distinct from an audio-only source.
+	AudioMimeType string
+	VideoMimeType string
+
+	CPUTime   time.Duration // user + system time, from the exited handlers' rusage
+	Duration  time.Duration // wall time the handlers ran
+	MaxCPU    float64       // highest 1s sample, in cores
+	MaxMemory int           // highest sampled RSS, in bytes
+}
+
+// AvgCPU is the average number of cores used while a handler ran.
+func (u *SessionUsage) AvgCPU() float64 {
+	if u.Duration <= 0 {
+		return 0
+	}
+	return u.CPUTime.Seconds() / u.Duration.Seconds()
+}
+
+// TypeLabel is the session's input kind as a metric label: rtmp, whip, url,
+// or unknown. WHIP sessions that bypass transcoding run in the service
+// process without a handler, so they have no usage record and are never
+// observed; whip therefore only covers transcoding sessions.
+func (u *SessionUsage) TypeLabel() string {
+	switch u.InputType {
+	case livekit.IngressInput_RTMP_INPUT:
+		return typeLabelRTMP
+	case livekit.IngressInput_WHIP_INPUT:
+		return typeLabelWHIP
+	case livekit.IngressInput_URL_INPUT:
+		return typeLabelURL
+	}
+	return labelUnknown
+}
+
+// MediaLabel is the media the source carried as a metric label: audio, video,
+// av, or unknown while no track has been reported.
+func (u *SessionUsage) MediaLabel() string {
+	switch {
+	case u.AudioMimeType != "" && u.VideoMimeType != "":
+		return mediaLabelAV
+	case u.AudioMimeType != "":
+		return mediaLabelAudio
+	case u.VideoMimeType != "":
+		return mediaLabelVideo
+	}
+	return labelUnknown
+}
+
+type handlerRun struct {
+	usage     *SessionUsage
+	startedAt time.Time
+}
+
 func NewMonitor() *Monitor {
-	return &Monitor{}
+	return &Monitor{
+		usage:    make(map[string]*SessionUsage),
+		handlers: make(map[int]*handlerRun),
+		peaks:    make(map[string]float64),
+	}
 }
 
 func (m *Monitor) Start(conf *config.Config) error {
@@ -79,16 +184,16 @@ func (m *Monitor) Start(conf *config.Config) error {
 	m.costConfigLock.Unlock()
 
 	m.promCPULoad = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace:   "livekit",
+		Namespace:   promNamespace,
 		Subsystem:   "node",
 		Name:        "cpu_load",
-		ConstLabels: prometheus.Labels{"node_id": conf.NodeID, "node_type": "INGRESS"},
+		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID, "node_type": "INGRESS"},
 	})
 	m.promNodeAvailable = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Namespace:   "livekit",
-		Subsystem:   "ingress",
+		Namespace:   promNamespace,
+		Subsystem:   promSubsystemIngress,
 		Name:        "available",
-		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
 	}, func() float64 {
 		c := m.CanAccept()
 		if c {
@@ -97,19 +202,60 @@ func (m *Monitor) Start(conf *config.Config) error {
 		return 0
 	})
 	m.requestGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace:   "livekit",
-		Subsystem:   "ingress",
+		Namespace:   promNamespace,
+		Subsystem:   promSubsystemIngress,
 		Name:        "requests",
-		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
-	}, []string{"type", "transcoding"})
+		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
+	}, []string{promLabelType, promLabelTranscoding})
 	m.promPublicationCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace:   "livekit",
-		Subsystem:   "ingress",
+		Namespace:   promNamespace,
+		Subsystem:   promSubsystemIngress,
 		Name:        "publish_status",
-		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
-	}, []string{"type", "status"})
+		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
+	}, []string{promLabelType, "status"})
 
-	prometheus.MustRegister(m.promCPULoad, m.promNodeAvailable, m.requestGauge, m.promPublicationCounter)
+	promSessionLabels := []string{promLabelType, promLabelMedia}
+	promSessionConstLabels := prometheus.Labels{promLabelNodeID: conf.NodeID}
+	m.promSessionMaxCPU = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace:                       promNamespace,
+		Subsystem:                       promSubsystemIngress,
+		Name:                            "session_max_cpu_cores",
+		Help:                            "Highest 1s CPU sample of a session's handler processes, in cores, observed when the session ends",
+		ConstLabels:                     promSessionConstLabels,
+		Buckets:                         promSessionCPUBuckets,
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
+	}, promSessionLabels)
+	m.promSessionAvgCPU = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace:                       promNamespace,
+		Subsystem:                       promSubsystemIngress,
+		Name:                            "session_avg_cpu_cores",
+		Help:                            "Average CPU of a session's handler processes while they ran, in cores, observed when the session ends",
+		ConstLabels:                     promSessionConstLabels,
+		Buckets:                         promSessionCPUBuckets,
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: time.Hour,
+	}, promSessionLabels)
+	m.promSessionPeakCPU = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace:   promNamespace,
+		Subsystem:   promSubsystemIngress,
+		Name:        "session_max_cpu_cores_peak",
+		Help:        "Highest session_max_cpu_cores observed since the process started",
+		ConstLabels: promSessionConstLabels,
+	}, promSessionLabels)
+
+	prometheus.MustRegister(m.promCPULoad, m.promNodeAvailable, m.requestGauge, m.promPublicationCounter,
+		m.promSessionMaxCPU, m.promSessionAvgCPU, m.promSessionPeakCPU)
+
+	// handler usage is diagnostic only, so a failure here does not stop admission
+	procStats, err := hwstats.NewProcMonitor(m.updateHandlerStats)
+	if err != nil {
+		logger.Warnw("failed to start handler process monitor", err)
+	} else {
+		m.procStats = procStats
+	}
 
 	m.started.Break()
 
@@ -141,11 +287,17 @@ func (m *Monitor) Stop() {
 	if m.cpuStats != nil {
 		m.cpuStats.Stop()
 	}
+	if m.procStats != nil {
+		m.procStats.Stop()
+	}
 
 	prometheus.Unregister(m.promCPULoad)
 	prometheus.Unregister(m.requestGauge)
 	prometheus.Unregister(m.promNodeAvailable)
 	prometheus.Unregister(m.promPublicationCounter)
+	prometheus.Unregister(m.promSessionMaxCPU)
+	prometheus.Unregister(m.promSessionAvgCPU)
+	prometheus.Unregister(m.promSessionPeakCPU)
 }
 
 // RecordPublicationResult records the outcome of a stream publication attempt,
@@ -157,19 +309,12 @@ func (m *Monitor) RecordPublicationResult(ingressType string, err error) {
 	}
 
 	m.promPublicationCounter.With(prometheus.Labels{
-		"type":   ingressType,
-		"status": publicationStatus(err),
+		promLabelType: ingressType,
+		"status":      publicationStatus(err),
 	}).Inc()
 }
 
 func publicationStatus(err error) string {
-	const (
-		publicationStatusSuccess  = "success"
-		publicationStatus4xx      = "4xx"
-		publicationStatus5xx      = "5xx"
-		publicationStatusInternal = "internal"
-	)
-
 	if err == nil {
 		return publicationStatusSuccess
 	}
@@ -381,11 +526,11 @@ func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) bool {
 func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "rtmp", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelRTMP, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
 	case livekit.IngressInput_WHIP_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "whip", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelWHIP, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
 	case livekit.IngressInput_URL_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "url", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelURL, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
 
 	}
 }
@@ -393,11 +538,121 @@ func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
 func (m *Monitor) IngressEnded(info *livekit.IngressInfo) {
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "rtmp", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelRTMP, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
 	case livekit.IngressInput_WHIP_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "whip", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelWHIP, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
 	case livekit.IngressInput_URL_INPUT:
-		m.requestGauge.With(prometheus.Labels{"type": "url", "transcoding": fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
+		m.requestGauge.With(prometheus.Labels{promLabelType: typeLabelURL, promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
+	}
+}
+
+// HandlerStarted attributes the handler process pid to the session in info.
+func (m *Monitor) HandlerStarted(info *livekit.IngressInfo, pid int) {
+	resourceID := info.GetState().GetResourceId()
+
+	m.usageLock.Lock()
+	defer m.usageLock.Unlock()
+
+	u := m.usage[resourceID]
+	if u == nil {
+		u = &SessionUsage{
+			IngressID:   info.IngressId,
+			ResourceID:  resourceID,
+			InputType:   info.InputType,
+			Transcoding: info.GetEnableTranscoding(),
+		}
+		m.usage[resourceID] = u
+	}
+	m.handlers[pid] = &handlerRun{usage: u, startedAt: time.Now()}
+}
+
+// HandlerStateUpdated records the input track mime types from a state update
+// the handler sent for the session in info. An update for a session without a
+// usage record is ignored: the record exists from HandlerStarted until
+// SessionEnded, and a late update must not recreate it.
+func (m *Monitor) HandlerStateUpdated(info *livekit.IngressInfo) {
+	state := info.GetState()
+	if state == nil {
+		return
+	}
+
+	m.usageLock.Lock()
+	defer m.usageLock.Unlock()
+
+	u := m.usage[state.GetResourceId()]
+	if u == nil {
+		return
+	}
+	if mime := state.GetAudio().GetMimeType(); mime != "" {
+		u.AudioMimeType = mime
+	}
+	if mime := state.GetVideo().GetMimeType(); mime != "" {
+		u.VideoMimeType = mime
+	}
+}
+
+// HandlerExited adds the run of the exited handler pid to its session's usage.
+func (m *Monitor) HandlerExited(pid int, state *os.ProcessState) {
+	m.usageLock.Lock()
+	defer m.usageLock.Unlock()
+
+	h := m.handlers[pid]
+	if h == nil {
+		return
+	}
+	delete(m.handlers, pid)
+
+	h.usage.Duration += time.Since(h.startedAt)
+	if state != nil {
+		h.usage.CPUTime += state.UserTime() + state.SystemTime()
+	}
+}
+
+// SessionEnded returns the session's handler usage, or nil if no handler ran for it.
+func (m *Monitor) SessionEnded(resourceID string) *SessionUsage {
+	m.usageLock.Lock()
+	defer m.usageLock.Unlock()
+
+	u := m.usage[resourceID]
+	if u == nil {
+		return nil
+	}
+	delete(m.usage, resourceID)
+	m.observeSessionLocked(u)
+
+	ret := *u
+	return &ret
+}
+
+// observeSessionLocked records an ended session's usage in the session
+// metrics. It is a no-op before Start. The caller holds usageLock.
+func (m *Monitor) observeSessionLocked(u *SessionUsage) {
+	if m.promSessionMaxCPU == nil {
+		return
+	}
+
+	kind, media := u.TypeLabel(), u.MediaLabel()
+	m.promSessionMaxCPU.WithLabelValues(kind, media).Observe(u.MaxCPU)
+	m.promSessionAvgCPU.WithLabelValues(kind, media).Observe(u.AvgCPU())
+
+	key := kind + "|" + media
+	if peak, ok := m.peaks[key]; !ok || u.MaxCPU > peak {
+		m.peaks[key] = u.MaxCPU
+		m.promSessionPeakCPU.WithLabelValues(kind, media).Set(u.MaxCPU)
+	}
+}
+
+func (m *Monitor) updateHandlerStats(stats *hwstats.ProcStats) {
+	m.usageLock.Lock()
+	defer m.usageLock.Unlock()
+
+	for pid, h := range m.handlers {
+		if cpu := stats.Cpu[pid]; cpu > h.usage.MaxCPU {
+			h.usage.MaxCPU = cpu
+		}
+		if gm := stats.Memory[pid]; gm != nil && gm.Total > h.usage.MaxMemory {
+			h.usage.MaxMemory = gm.Total
+		}
 	}
 }
 

@@ -5,7 +5,7 @@ package urlpull
 import (
 	"testing"
 
-	"github.com/go-gst/go-gst/gst"
+	"github.com/go-gst/go-gst/pkg/gst"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,29 +35,24 @@ func TestRTSPStreamPolicyDeclinedStreamsAreFree(t *testing.T) {
 }
 
 func TestRTSPStreamDescription(t *testing.T) {
-	gst.Init(nil)
+	gst.Init()
 
-	media, enc := rtspStreamDescription(gst.NewCapsFromString(
+	media, enc := rtspStreamDescription(gst.CapsFromString(
 		"application/x-rtp, media=(string)video, payload=(int)96, clock-rate=(int)90000, encoding-name=(string)H264"))
 	require.Equal(t, "video", media)
 	require.Equal(t, "H264", enc)
 
-	media, enc = rtspStreamDescription(gst.NewCapsFromString("application/x-rtp, media=(string)application"))
+	media, enc = rtspStreamDescription(gst.CapsFromString("application/x-rtp, media=(string)application"))
 	require.Equal(t, "application", media)
 	require.Equal(t, "", enc)
 
-	media, enc = rtspStreamDescription(gst.NewCapsFromString("audio/x-raw"))
+	media, enc = rtspStreamDescription(gst.CapsFromString("audio/x-raw"))
 	require.Equal(t, "", media)
 	require.Equal(t, "", enc)
 
-	// A pad added before negotiation has no caps, and go-gst hands a NULL
-	// caps pointer over as a non-nil wrapper; neither may crash the streaming
-	// thread that calls this.
+	// A pad added before negotiation has no caps; that may not crash the
+	// streaming thread that calls this.
 	media, enc = rtspStreamDescription(nil)
-	require.Equal(t, "", media)
-	require.Equal(t, "", enc)
-
-	media, enc = rtspStreamDescription(gst.ToGstCaps(nil))
 	require.Equal(t, "", media)
 	require.Equal(t, "", enc)
 }

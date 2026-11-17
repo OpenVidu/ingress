@@ -17,145 +17,88 @@
 package test
 
 import (
-	"context"
 	"fmt"
 	"os/exec"
-	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/psrpc"
-
-	"github.com/livekit/ingress/pkg/params"
-	"github.com/livekit/ingress/pkg/service"
-	"github.com/livekit/ingress/pkg/utils"
-	"github.com/livekit/ingress/pkg/whip"
 )
 
-const (
-	whipClientPath = "livekit-whip-bot/cmd/whip-client/whip-client"
-)
+// whipClientBinary is the publisher from the livekit-whip-bot submodule. It is
+// looked up on PATH rather than at a path relative to the working directory,
+// which is /workspace under the prebuilt test binary and /workspace/test under
+// go test.
+const whipClientBinary = "whip-client"
 
-func RunWHIPTest(t *testing.T, conf *TestConfig, bus psrpc.MessageBus, commandPsrpcClient rpc.IngressHandlerClient, psrpcClient rpc.IOInfoClient, sn utils.StateNotifier, newCmd func(ctx context.Context, p *params.Params) (*exec.Cmd, error)) {
-	whipsrv, err := whip.NewWHIPServer(bus)
-	require.NoError(t, err)
-	relay := service.NewRelay(nil, whipsrv)
+// whipPublisher publishes a synthetic camera and microphone over WHIP for the
+// life of the case.
+type whipPublisher struct {
+	proc *publisher
+}
 
-	svc, err := service.NewService(conf.Config, psrpcClient, sn, bus, nil, whipsrv, newCmd, "")
-	require.NoError(t, err)
-	go func() {
-		err := svc.Run()
-		require.NoError(t, err)
-	}()
+func (*whipPublisher) pulls() bool { return false }
 
-	err = whipsrv.Start(conf.Config, svc.HandleWHIPPublishRequest, svc.GetHealthHandlers())
-	require.NoError(t, err)
-	err = relay.Start(conf.Config)
-	require.NoError(t, err)
+// url is the endpoint prefix. The stream key is appended per publisher rather
+// than baked in here, since it is also what the ingress is resolved by.
+func (*whipPublisher) url(_ *testing.T, r *Runner, _ string) string {
+	return fmt.Sprintf("http://localhost:%d/w", r.WHIPPort)
+}
 
-	t.Cleanup(func() {
-		relay.Stop()
-		whipsrv.Stop()
-		svc.Stop(true)
-	})
+func (s *whipPublisher) publish(t *testing.T, info *livekit.IngressInfo) {
+	bin, err := exec.LookPath(whipClientBinary)
+	require.NoError(t, err, "build it with: go build -o <dir on PATH>/%s "+
+		"./cmd/whip-client, from test/livekit-whip-bot", whipClientBinary)
 
-	updates := make(chan *rpc.UpdateIngressStateRequest, 10)
-	ios := &ioServer{}
-	ios.updateIngressState = func(req *rpc.UpdateIngressStateRequest) error {
-		updates <- req
-		return nil
+	s.proc = publish(t, bin, "-url", fmt.Sprintf("%s/%s", info.Url, info.StreamKey))
+}
+
+// endStream signals whip-client, which sends the WHIP DELETE for its session
+// before exiting.
+func (s *whipPublisher) endStream(t *testing.T) { s.proc.endStream(t) }
+
+func (r *Runner) testWHIP(t *testing.T) {
+	if !r.runWHIP() {
+		return
 	}
 
-	tr := true
+	transcode := true
 
-	info := &livekit.IngressInfo{
-		IngressId:           "ingress_id",
-		InputType:           livekit.IngressInput_WHIP_INPUT,
-		Name:                "ingress-test",
-		RoomName:            conf.RoomName,
-		ParticipantIdentity: "ingress-test",
-		ParticipantName:     "ingress-test",
-		Reusable:            true,
-		StreamKey:           "ingress-test",
-		Url:                 "http://localhost:8080/w",
-		EnableTranscoding:   &tr,
-		Audio: &livekit.IngressAudioOptions{
-			Name:   "audio",
-			Source: 0,
-			EncodingOptions: &livekit.IngressAudioOptions_Options{
-				Options: &livekit.IngressAudioEncodingOptions{
-					AudioCodec: livekit.AudioCodec_OPUS,
-					Bitrate:    64000,
-					DisableDtx: false,
-					Channels:   2,
-				},
+	t.Run("WHIP", func(t *testing.T) {
+		for _, tc := range []*testCase{
+			{
+				name:      "DeletedWhilePublishing",
+				inputType: livekit.IngressInput_WHIP_INPUT,
+				source:    &whipPublisher{},
+				video: videoOptions(
+					videoLayer(livekit.VideoQuality_HIGH, 1280, 720, 3000000),
+					videoLayer(livekit.VideoQuality_LOW, 640, 360, 1000000),
+				),
+				enableTranscoding: &transcode,
+				reusable:          true,
+				endBy:             endByDelete,
+				runFor:            streamDuration,
+				// Unlike RTMP, the WHIP read is not bound to the context the
+				// stop cancels, so the session ends clean.
+				expect: livekit.IngressState_ENDPOINT_INACTIVE,
 			},
-		},
-		Video: &livekit.IngressVideoOptions{
-			Name:   "video",
-			Source: 0,
-			EncodingOptions: &livekit.IngressVideoOptions_Options{
-				Options: &livekit.IngressVideoEncodingOptions{
-					VideoCodec: livekit.VideoCodec_H264_BASELINE,
-					FrameRate:  20,
-					Layers: []*livekit.VideoLayer{
-						{
-							Quality: livekit.VideoQuality_HIGH,
-							Width:   1280,
-							Height:  720,
-							Bitrate: 3000000,
-						},
-						{
-							Quality: livekit.VideoQuality_LOW,
-							Width:   640,
-							Height:  360,
-							Bitrate: 1000000,
-						},
-					},
-				},
+			{
+				name:      "EndedByPublisher",
+				inputType: livekit.IngressInput_WHIP_INPUT,
+				source:    &whipPublisher{},
+				video: videoOptions(
+					videoLayer(livekit.VideoQuality_HIGH, 1280, 720, 3000000),
+					videoLayer(livekit.VideoQuality_LOW, 640, 360, 1000000),
+				),
+				enableTranscoding: &transcode,
+				reusable:          false,
+				endBy:             endBySource,
+				runFor:            sourceEndDuration,
+				expect:            livekit.IngressState_ENDPOINT_COMPLETE,
 			},
-		},
-	}
-	ios.getIngressInfo = func(_ *rpc.GetIngressInfoRequest) (*rpc.GetIngressInfoResponse, error) {
-		return &rpc.GetIngressInfoResponse{Info: info, WsUrl: conf.WsUrl}, nil
-	}
-
-	ioPsrpc, err := rpc.NewIOInfoServer(ios, bus)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		ioPsrpc.Kill()
+		} {
+			r.run(t, tc)
+		}
 	})
-
-	time.Sleep(1 * time.Second)
-
-	logger.Infow("whip url", "url", info.Url, "streamKey", info.StreamKey)
-
-	whipUrl := fmt.Sprintf("%s/%s", info.Url, info.StreamKey)
-
-	cmdString := strings.Split(
-		fmt.Sprintf("%s -url %s", whipClientPath, whipUrl),
-		" ")
-	cmd := exec.Command(cmdString[0], cmdString[1:]...)
-	require.NoError(t, cmd.Start())
-
-	t.Cleanup(func() {
-		syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
-	})
-
-	time.Sleep(time.Second * 45)
-
-	_, err = commandPsrpcClient.DeleteIngress(context.Background(), info.IngressId, &livekit.DeleteIngressRequest{IngressId: info.IngressId})
-	require.NoError(t, err)
-
-	time.Sleep(time.Second * 2)
-
-	final := <-updates
-	require.NotEqual(t, final.State.Status, livekit.IngressState_ENDPOINT_ERROR)
-
 }

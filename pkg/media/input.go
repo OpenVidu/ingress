@@ -21,9 +21,10 @@ import (
 	"time"
 
 	"github.com/frostbyte73/core"
-	"github.com/go-gst/go-gst/gst"
+	"github.com/go-gst/go-gst/pkg/gst"
 
 	"github.com/livekit/ingress/pkg/errors"
+	"github.com/livekit/ingress/pkg/gstutil"
 	"github.com/livekit/ingress/pkg/media/rtmp"
 	"github.com/livekit/ingress/pkg/media/urlpull"
 	"github.com/livekit/ingress/pkg/media/whip"
@@ -40,7 +41,7 @@ const (
 )
 
 type Source interface {
-	GetSources() []*gst.Element
+	GetSources() []gst.Element
 	ValidateCaps(*gst.Caps) error
 	Start(ctx context.Context, onClose func()) error
 	Close() error
@@ -51,11 +52,11 @@ type Input struct {
 
 	trackStatsGatherer map[types.StreamKind]*stats.MediaTrackStatGatherer
 
-	bin    *gst.Bin
+	bin    gst.Bin
 	source Source
 
-	audioOutput *gst.Pad
-	videoOutput *gst.Pad
+	audioOutput gst.Pad
+	videoOutput gst.Pad
 
 	onOutputReady OutputReadyFunc
 	closeFuse     core.Fuse
@@ -75,7 +76,7 @@ type Input struct {
 	onEOS func()
 }
 
-type OutputReadyFunc func(pad *gst.Pad, kind types.StreamKind)
+type OutputReadyFunc func(pad gst.Pad, kind types.StreamKind)
 
 func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGatherer) (*Input, error) {
 	src, err := CreateSource(ctx, p)
@@ -83,7 +84,7 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 		return nil, err
 	}
 
-	bin := gst.NewBin("input")
+	bin := gstutil.NewBin("input")
 
 	i := &Input{
 		bin:                          bin,
@@ -92,7 +93,7 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 		enableStreamLatencyReduction: shouldEnableStreamLatencyReduction(p),
 		padTiming:                    make(map[string]*padTimingState),
 		gateReady:                    make(map[string]bool),
-		latencyCaps:                  gst.NewCapsFromString(packetLatencyCaps),
+		latencyCaps:                  gst.CapsFromString(packetLatencyCaps),
 	}
 
 	// BEGIN OPENVIDU BLOCK
@@ -103,7 +104,7 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 		if !ok {
 			return nil, errors.New("URL is rtsp but source is not of type URLSource")
 		}
-		if err := bin.Add(urlsource.Rtspsrc); err != nil {
+		if err := gstutil.Add(bin, urlsource.Rtspsrc); err != nil {
 			return nil, err
 		}
 	}
@@ -121,20 +122,18 @@ func NewInput(ctx context.Context, p *params.Params, g *stats.LocalMediaStatsGat
 	}
 
 	for _, src := range srcs {
-		decodeBin, err := gst.NewElement("decodebin3")
+		decodeBin, err := gstutil.NewElement("decodebin3")
 		if err != nil {
 			return nil, err
 		}
 
-		if err := bin.AddMany(decodeBin, src); err != nil {
+		if err := gstutil.AddMany(bin, decodeBin, src); err != nil {
 			return nil, err
 		}
 
-		if _, err = decodeBin.Connect("pad-added", i.onPadAdded); err != nil {
-			return nil, err
-		}
+		decodeBin.Connect("pad-added", i.onPadAdded)
 
-		if err = src.Link(decodeBin); err != nil {
+		if err = gstutil.Link(src, decodeBin); err != nil {
 			return nil, err
 		}
 	}
@@ -193,34 +192,22 @@ func (i *Input) Close() error {
 	return i.closeErr
 }
 
-func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
+func (i *Input) onPadAdded(_ gst.Element, pad gst.Pad) {
 	var err error
 
 	defer func() {
 		if err != nil {
-			msg := gst.NewErrorMessage(i.bin.Element, err, err.Error(), nil)
-			i.bin.Element.GetBus().Post(msg)
+			i.bin.PostMessage(gst.NewMessageError(i.bin, err.Error(), err))
 		}
 	}()
 
-	typefind, err := i.bin.GetElementByName("typefind")
 	// BEGIN OPENVIDU BLOCK
-	// That lookup recurses through the whole input bin, and every decodebin3
-	// owns a child named "typefind" (inside its parsebin). With one decodebin
-	// per source, as the RTSP path and WHIP transcoding have, it can return the
-	// typefind of the *other* stream, whose caps may still be NULL: go-gst
-	// wraps those as a non-nil *gst.Caps of size 0 and the validation fails for
-	// a stream that is fine. Validate the stream that produced this pad instead:
-	// its typefind lives inside decodeBin.
-	if tf := findDecodeTypefind(decodeBin); tf != nil {
-		typefind, err = tf, nil
-	}
-	// END OPENVIDU BLOCK
-	if err == nil && typefind != nil {
-		var caps interface{}
-		caps, err = typefind.GetProperty("caps")
-		if err == nil && caps != nil {
-			err = i.source.ValidateCaps(caps.(*gst.Caps))
+	// GetByName("typefind") is ambiguous with one decodebin per stream (RTSP,
+	// WHIP transcoding): validate the decodebin behind this pad (input_openvidu.go).
+	if typefind := decodeTypefind(i.bin, pad); typefind != nil {
+		// END OPENVIDU BLOCK
+		if caps := gstutil.Caps(typefind); caps != nil {
+			err = i.source.ValidateCaps(caps)
 			if err != nil {
 				logger.Infow("input caps validation failed", "error", err)
 				return
@@ -229,10 +216,8 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 	}
 
 	// Make sure we emit scte35 markers if available
-	tsparser, _ := i.bin.GetElementByName("tsdemux0")
-	if tsparser != nil {
-		err := tsparser.SetProperty("send-scte35-events", true)
-		if err != nil {
+	if tsparser := i.bin.GetByName("tsdemux0"); tsparser != nil {
+		if err := gstutil.SetProperty(tsparser, "send-scte35-events", true); err != nil {
 			logger.Errorw("failed setting `send-scte35-events` property", err)
 		}
 	}
@@ -241,14 +226,14 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 	i.lock.Lock()
 	newPad := false
 	var kind types.StreamKind
-	var ghostPad *gst.GhostPad
+	var ghostPad gst.GhostPad
 	var timingState *padTimingState
 	if strings.HasPrefix(pad.GetName(), "audio") {
 		if i.audioOutput == nil {
 			newPad = true
 			kind = types.Audio
 			i.audioOutput = pad
-			ghostPad = gst.NewGhostPad("audio", pad)
+			ghostPad = gst.NewGhostPad("audio", pad).(gst.GhostPad)
 			timingState = &padTimingState{}
 		}
 	} else if strings.HasPrefix(pad.GetName(), "video") {
@@ -256,7 +241,7 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 			newPad = true
 			kind = types.Video
 			i.videoOutput = pad
-			ghostPad = gst.NewGhostPad("video", pad)
+			ghostPad = gst.NewGhostPad("video", pad).(gst.GhostPad)
 			timingState = &padTimingState{}
 		}
 	}
@@ -264,25 +249,22 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 
 	// don't need this pad, link to fakesink
 	if !newPad {
-		var sink *gst.Element
+		var sink gst.Element
 
-		sink, err = gst.NewElement("fakesink")
+		sink, err = gstutil.NewElement("fakesink")
 		if err != nil {
 			logger.Errorw("failed to create fakesink", err)
 			return
 		}
-		var pads []*gst.Pad
-
-		pads, err = sink.GetSinkPads()
-		pad.Link(pads[0])
+		pad.Link(sink.GetStaticPad("sink"))
 		return
 	}
 
-	if !i.bin.AddPad(ghostPad.Pad) {
+	if !i.bin.AddPad(ghostPad) {
 		logger.Errorw("failed to add ghost pad", nil)
 		return
 	}
-	pad = ghostPad.Pad
+	pad = ghostPad
 	padName := pad.GetName()
 
 	logger.Debugw("input ghost pad added", "padName", padName)
@@ -295,49 +277,37 @@ func (i *Input) onPadAdded(decodeBin *gst.Element, pad *gst.Pad) {
 	}
 
 	// Gather bitrate stats & attach latency meta from the pipeline
-	// BEGIN OPENVIDU BLOCK
-	// Pass the decodebin that produced this pad so the stats probe can locate
-	// the correct internal multiqueue even when multiple decodebins exist (RTSP).
-	i.addStatsCollectionProbe(decodeBin, kind)
-	// END OPENVIDU BLOCK
+	i.addStatsCollectionProbe(kind)
 
 	if i.onOutputReady != nil {
 		i.onOutputReady(pad, kind)
 	}
 }
 
-func (i *Input) addStatsCollectionProbe(decodeBin *gst.Element, kind types.StreamKind) {
+func (i *Input) addStatsCollectionProbe(kind types.StreamKind) {
 	// Do a best effort to add probe to retrieve bitrate and ingest time metadata.
 	// Time metadata would be best ingested at the source but flv muxer doesn't support carrying it through.
 	// The multiqueue is generally created in the pipeline before the decoders
-
+	mq := i.bin.GetByName("multiqueue0")
 	// BEGIN OPENVIDU BLOCK
-	// The OpenVidu RTSP path builds one decodebin per stream (audio + video), so
-	// the process-global "multiqueue0" name no longer identifies the decoder for
-	// a given kind. Locate the multiqueue inside the decodebin that produced this
-	// pad; fall back to the legacy global lookup for single-decodebin inputs.
-	mq := findDecodeMultiqueue(decodeBin)
-	if mq == nil {
-		var err error
-		mq, err = i.bin.GetElementByName("multiqueue0")
-		if err != nil {
-			// No multiqueue in that pipeline
-			logger.Debugw("could not retrieve multiqueue element from pipeline", "error", err)
-			return
-		}
+	// multiqueue0 may belong to the other stream's decodebin (RTSP builds one per
+	// stream): use the one of the decodebin behind this kind's pad (input_openvidu.go).
+	if own := i.decodeMultiqueue(kind); own != nil {
+		mq = own
 	}
 	// END OPENVIDU BLOCK
-
-	pads, err := mq.GetSinkPads()
-	if err != nil {
-		logger.Errorw("failed retrieving multiqueue sink pads", err)
+	if mq == nil {
+		// No multiqueue in that pipeline
+		logger.Debugw("could not retrieve multiqueue element from pipeline")
 		return
 	}
+
+	pads := gstutil.SinkPads(mq)
 
 	for _, pad := range pads {
 		caps := pad.GetCurrentCaps()
 		if caps != nil && caps.GetSize() > 0 {
-			gstStruct := caps.GetStructureAt(0)
+			gstStruct := caps.GetStructure(0)
 			padKind := getKindFromGstMimeType(gstStruct)
 
 			g := i.trackStatsGatherer[kind]
@@ -345,21 +315,21 @@ func (i *Input) addStatsCollectionProbe(decodeBin *gst.Element, kind types.Strea
 			if padKind == kind {
 				var lastAttached time.Time
 
-				pad.AddProbe(gst.PadProbeTypeBuffer, func(_ *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
-					buffer := info.GetBuffer()
+				pad.AddProbe(gst.PadProbeTypeBuffer, func(_ gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+					buffer := gstutil.ProbeBuffer(info)
 					if buffer == nil {
 						return gst.PadProbeOK
 					}
 
 					size := buffer.GetSize()
 					if g != nil {
-						g.MediaReceived(size)
+						g.MediaReceived(int64(size))
 					}
 
 					// mark the packet with the current time to be able to calculate packet processing latency at output stage
 					now := time.Now()
-					if now.Sub(lastAttached) >= latencySampleInterval && buffer.IsWritable() {
-						buffer.AddReferenceTimestampMeta(i.latencyCaps, gst.ClockTime(uint64(now.UnixNano())), gst.ClockTime(0))
+					if now.Sub(lastAttached) >= latencySampleInterval && gstutil.BufferIsWritable(buffer) {
+						gstutil.AddReferenceTimestamp(buffer, i.latencyCaps, gst.ClockTime(uint64(now.UnixNano())))
 						lastAttached = now
 					}
 
@@ -369,50 +339,12 @@ func (i *Input) addStatsCollectionProbe(decodeBin *gst.Element, kind types.Strea
 				return
 			}
 		} else {
-			logger.Debugw("could not retrieve multiqueue pad caps", "error", err)
+			logger.Debugw("could not retrieve multiqueue pad caps")
 		}
 	}
 
 	logger.Debugw("no pad on multiqueue with required kind found", "kind", kind)
 }
-
-// BEGIN OPENVIDU BLOCK
-// findDecodeMultiqueue returns the internal multiqueue element of the given
-// decodebin, or nil if it has none. decodebin3 creates its multiqueue eagerly,
-// but its process-global name (multiqueue0, multiqueue1, ...) depends on
-// creation order, so we search by name prefix within the decodebin rather than
-// relying on a fixed global name (which breaks when >1 decodebin exists).
-func findDecodeMultiqueue(decodeBin *gst.Element) *gst.Element {
-	return findDecodeElement(decodeBin, "multiqueue")
-}
-
-// findDecodeTypefind returns the typefind element of the given decodebin (the
-// one its parsebin runs on the input stream), or nil if it has none. Every
-// decodebin3 has one and they all share the name "typefind", so a by-name
-// lookup from the pipeline is ambiguous as soon as there are two decodebins.
-func findDecodeTypefind(decodeBin *gst.Element) *gst.Element {
-	return findDecodeElement(decodeBin, "typefind")
-}
-
-// findDecodeElement returns the first element inside decodeBin whose name
-// starts with prefix, or nil.
-func findDecodeElement(decodeBin *gst.Element, prefix string) *gst.Element {
-	if decodeBin == nil {
-		return nil
-	}
-	elems, err := gst.ToGstBin(decodeBin).GetElementsRecursive()
-	if err != nil {
-		return nil
-	}
-	for _, e := range elems {
-		if strings.HasPrefix(e.GetName(), prefix) {
-			return e
-		}
-	}
-	return nil
-}
-
-// END OPENVIDU BLOCK
 
 func shouldEnableStreamLatencyReduction(p *params.Params) bool {
 	enableGate := p.EnableStreamLatencyReduction

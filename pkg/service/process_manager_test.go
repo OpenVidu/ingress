@@ -18,12 +18,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/livekit/ingress/pkg/ipc"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/stats"
 	"github.com/livekit/ingress/pkg/testutil"
@@ -32,6 +34,8 @@ import (
 	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/psrpc"
 )
+
+const testResourceID = "res_test"
 
 func newTestProcessManager(t *testing.T) (*ProcessManager, psrpc.MessageBus) {
 	bus := psrpc.NewLocalMessageBus()
@@ -45,7 +49,7 @@ func newTestParams(tmpDir string) *params.Params {
 	return &params.Params{
 		IngressInfo: &livekit.IngressInfo{
 			IngressId: "in_test",
-			State:     &livekit.IngressState{ResourceId: "res_test"},
+			State:     &livekit.IngressState{ResourceId: testResourceID},
 		},
 		TmpDir: tmpDir,
 	}
@@ -106,4 +110,74 @@ func TestStartIngressFailsCleanlyWhenTmpDirCannotBeCreated(t *testing.T) {
 	require.Error(t, err)
 
 	requireNoResidue(t, pm, bus, tmpDir)
+}
+
+// recordingStateNotifier keeps the last state update it was asked to forward.
+type recordingStateNotifier struct {
+	utils.StateNotifier
+	projectID string
+	info      *livekit.IngressInfo
+}
+
+func (n *recordingStateNotifier) UpdateIngressState(_ context.Context, projectID string, info *livekit.IngressInfo) error {
+	n.projectID = projectID
+	n.info = info
+	return nil
+}
+
+func TestUpdateIngressStateRecordsTracksAndForwards(t *testing.T) {
+	notifier := &recordingStateNotifier{StateNotifier: utils.NewNoopStateNotifier()}
+	monitor := stats.NewMonitor()
+	sm := NewSessionManager(monitor, nil)
+	pm, err := NewProcessManager(sm, notifier, psrpc.NewLocalMessageBus(), nil)
+	require.NoError(t, err)
+
+	info := newTestParams("").IngressInfo
+	h := &process{params: newTestParams("")}
+	pm.activeHandlers[testResourceID] = h
+	monitor.HandlerStarted(info, 1)
+	info.State.Audio = &livekit.InputAudioState{MimeType: "audio/opus"}
+	info.State.Video = &livekit.InputVideoState{MimeType: "video/VP8"}
+	info.State.UpdatedAt = time.Now().Add(-time.Second).UnixNano()
+
+	_, err = pm.UpdateIngressState(context.Background(), &ipc.UpdateIngressStateRequest{ProjectId: "p_test", Info: info})
+	require.NoError(t, err)
+
+	require.Equal(t, "p_test", notifier.projectID)
+	require.Same(t, info, notifier.info, "the update is forwarded as received")
+
+	// a killed handler's final update keeps what it last reported
+	pm.publishKilledState(context.Background(), h)
+	require.Equal(t, livekit.IngressState_ENDPOINT_ERROR, notifier.info.State.Status)
+	require.Equal(t, "audio/opus", notifier.info.State.Audio.MimeType)
+	require.Greater(t, notifier.info.State.UpdatedAt, info.State.UpdatedAt)
+
+	u := monitor.SessionEnded(testResourceID)
+	require.NotNil(t, u)
+	require.Equal(t, "in_test", u.IngressID)
+	require.Equal(t, "audio/opus", u.AudioMimeType)
+	require.Equal(t, "video/VP8", u.VideoMimeType)
+}
+
+// A handler that ignores KillIngress would otherwise keep its session open
+// until the pod dies.
+func TestKillAfterKillsHandlerStillRunning(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	require.NoError(t, cmd.Start())
+
+	p := &process{params: newTestParams("")}
+	p.proc.Store(cmd.Process)
+	p.killAfter(50 * time.Millisecond)
+
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	select {
+	case err := <-exited:
+		require.EqualError(t, err, "signal: killed")
+		require.True(t, p.forceKilled.Load(), "the final ERROR update depends on this")
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("handler was not killed")
+	}
 }
