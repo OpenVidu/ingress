@@ -39,5 +39,8 @@ func RunTestSuite(
 
 	r.testRTMP(t)
 	r.testURL(t)
+	// BEGIN OPENVIDU BLOCK
+	r.testOpenViduURL(t)
+	// END OPENVIDU BLOCK
 	r.testWHIP(t)
 }

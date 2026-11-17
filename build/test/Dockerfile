@@ -87,6 +87,14 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
     cd test/livekit-whip-bot && \
     go build -o /usr/local/bin/whip-client ./cmd/whip-client
 
+# BEGIN OPENVIDU BLOCK
+# The sources of the OpenVidu integration cases (test/url_openvidu.go): an RTSP
+# server, at the release openvidu-test-e2e pins in its images.Dockerfile, and
+# ffmpeg, whose MPEG-TS is the one an Opus-only pull used to fail on.
+COPY --from=bluenviron/mediamtx:1.21.3 /mediamtx /usr/local/bin/mediamtx
+COPY --from=mwader/static-ffmpeg:8.0.1 /ffmpeg /usr/local/bin/ffmpeg
+# END OPENVIDU BLOCK
+
 FROM golangci/golangci-lint:${LINT_VERSION} AS golangci
 
 FROM builder AS lint
